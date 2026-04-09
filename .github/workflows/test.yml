@@ -1,0 +1,74 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.9", "3.10", "3.11", "3.12"]
+      fail-fast: false
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Run hook unit tests
+        run: python -m unittest keep-working/tests/test_hook.py -v
+
+      - name: Run CLI unit tests
+        run: python -m unittest keep-working/tests/test_cli.py -v
+
+      - name: Test install.sh in sandbox
+        shell: bash
+        run: |
+          SANDBOX=$(mktemp -d)
+          echo '{"model":"sonnet"}' > $SANDBOX/settings.json
+          CLAUDE_HOME=$SANDBOX bash keep-working/install.sh
+          # Sanity check the merge
+          python -c "
+          import json, sys
+          s = json.load(open('$SANDBOX/settings.json'))
+          h = s.get('hooks', {})
+          assert any('bind' in hh.get('command','') for g in h.get('PreToolUse', []) for hh in g.get('hooks', [])), 'PreToolUse hook missing'
+          assert any('stop' in hh.get('command','') for g in h.get('Stop', []) for hh in g.get('hooks', [])), 'Stop hook missing'
+          print('install.sh: ok')
+          "
+          # Re-run must be idempotent
+          CLAUDE_HOME=$SANDBOX bash keep-working/install.sh
+          python -c "
+          import json
+          s = json.load(open('$SANDBOX/settings.json'))
+          pre = [hh for g in s['hooks']['PreToolUse'] for hh in g['hooks'] if 'keep-working' in hh.get('command','')]
+          stop = [hh for g in s['hooks']['Stop'] for hh in g['hooks'] if 'keep-working' in hh.get('command','')]
+          assert len(pre) == 1, f'expected 1 bind hook, got {len(pre)}'
+          assert len(stop) == 1, f'expected 1 stop hook, got {len(stop)}'
+          print('install.sh idempotency: ok')
+          "
+          # Uninstall
+          CLAUDE_HOME=$SANDBOX bash keep-working/uninstall.sh
+          python -c "
+          import json
+          s = json.load(open('$SANDBOX/settings.json'))
+          hooks = s.get('hooks', {})
+          for ev, groups in hooks.items():
+              for g in groups:
+                  for h in g.get('hooks', []):
+                      assert 'keep-working' not in h.get('command',''), f'leftover hook: {h}'
+          print('uninstall.sh: ok')
+          "
+
+      - name: Test CLI runs
+        run: |
+          python keep-working/bin/keep-working version
+          python keep-working/bin/keep-working list
+          python keep-working/bin/keep-working doctor || true  # may fail without real install

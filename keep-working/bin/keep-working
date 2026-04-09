@@ -1,0 +1,403 @@
+#!/usr/bin/env python3
+"""
+keep-working — CLI helper for the keep-working skill.
+
+Subcommands:
+
+  status            Show all active keep-working sessions on this machine.
+  stop              Request the next active session to stop (writes the
+                    stop-request flag; the next tool call will honor it).
+  list              Same as status, terse one-line-per-session form.
+  clean             Remove ALL keep-working state files (orphans + active).
+                    Use this if things get into a weird state.
+  log [-n N]        Tail the last N lines of the keep-working log.
+  version           Print version.
+
+This is a convenience wrapper that reads/writes the same files the hook
+uses; it does not require Claude Code to be running.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+VERSION = "0.2.0"
+
+CLAUDE_DIR = Path(os.environ.get("CLAUDE_HOME", str(Path.home() / ".claude")))
+SESSIONS_DIR = CLAUDE_DIR / "keep-working"
+PENDING_FILE = CLAUDE_DIR / "keep-working-pending.json"
+STOP_REQUEST_FILE = CLAUDE_DIR / "keep-working-stop-request"
+LOG_FILE = SESSIONS_DIR / "log.txt"
+
+
+def _load_sessions() -> list[tuple[Path, dict]]:
+    out = []
+    if not SESSIONS_DIR.exists():
+        return out
+    for p in sorted(SESSIONS_DIR.iterdir()):
+        if not p.name.endswith(".json"):
+            continue
+        if p.name == LOG_FILE.name:
+            continue
+        try:
+            data = json.loads(p.read_text())
+        except Exception:
+            continue
+        out.append((p, data))
+    return out
+
+
+def _fmt_remaining(deadline_epoch: float) -> str:
+    rem = deadline_epoch - time.time()
+    if rem <= 0:
+        return "expired"
+    h = int(rem // 3600)
+    m = int((rem % 3600) // 60)
+    if h:
+        return f"{h}h{m:02d}m"
+    return f"{m}m"
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    sessions = _load_sessions()
+    if getattr(args, "json", False):
+        out = {
+            "pending": None,
+            "sessions": [],
+        }
+        if PENDING_FILE.exists():
+            try:
+                out["pending"] = json.loads(PENDING_FILE.read_text())
+            except Exception:
+                pass
+        for path, s in sessions:
+            out["sessions"].append({
+                "file": str(path),
+                "session_id": s.get("session_id"),
+                "task": s.get("task"),
+                "active": s.get("active", False),
+                "started_at": s.get("started_at"),
+                "deadline_epoch": s.get("deadline_epoch"),
+                "remaining_sec": max(0, int(s.get("deadline_epoch", 0) - time.time())),
+                "nudge_count": s.get("nudge_count", 0),
+                "max_turns": s.get("max_turns"),
+                "last_ctx_tokens": s.get("last_ctx_tokens"),
+                "max_tokens": s.get("max_tokens"),
+                "empty_stops": s.get("empty_stops", 0),
+            })
+        print(json.dumps(out, indent=2, ensure_ascii=False))
+        return 0
+    if PENDING_FILE.exists():
+        try:
+            p = json.loads(PENDING_FILE.read_text())
+            print(f"PENDING (not yet bound to a session)")
+            print(f"  task         : {p.get('task','')[:80]}")
+            print(f"  deadline     : {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(p.get('deadline_epoch',0)))}")
+            print(f"  remaining    : {_fmt_remaining(p.get('deadline_epoch',0))}")
+            print()
+        except Exception:
+            pass
+    if not sessions:
+        if not PENDING_FILE.exists():
+            print("No active keep-working sessions.")
+        return 0
+    for path, s in sessions:
+        sid = s.get("session_id", path.stem)
+        print(f"SESSION {sid[:12]}…  ({path.name})")
+        print(f"  task         : {s.get('task','')[:80]}")
+        print(f"  active       : {s.get('active', False)}")
+        print(f"  started_at   : {s.get('started_at','?')}")
+        deadline = s.get("deadline_epoch", 0)
+        print(f"  deadline     : {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(deadline))}")
+        print(f"  remaining    : {_fmt_remaining(deadline)}")
+        print(f"  nudges       : {s.get('nudge_count',0)} / {s.get('max_turns','?')}")
+        print(f"  ctx tokens   : {s.get('last_ctx_tokens','?')} / {s.get('max_tokens','?')}")
+        print(f"  empty stops  : {s.get('empty_stops',0)}")
+        print()
+    return 0
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    sessions = _load_sessions()
+    if not sessions:
+        print("(no sessions)")
+        return 0
+    for path, s in sessions:
+        sid = s.get("session_id", path.stem)[:12]
+        rem = _fmt_remaining(s.get("deadline_epoch", 0))
+        nudge = s.get("nudge_count", 0)
+        cap = s.get("max_turns", "∞")
+        task = (s.get("task", "") or "")[:50]
+        print(f"{sid:13}  {rem:>8}  {nudge}/{cap}  {task}")
+    return 0
+
+
+def cmd_stop(args: argparse.Namespace) -> int:
+    sessions = _load_sessions()
+    active = [(p, s) for p, s in sessions if s.get("active")]
+    if not active:
+        if args.force:
+            CLAUDE_DIR.mkdir(parents=True, exist_ok=True)
+            STOP_REQUEST_FILE.write_text("stop\n")
+            print(f"✓ Wrote {STOP_REQUEST_FILE} (--force)")
+            print("  Warning: no active sessions right now. This flag will deactivate")
+            print("  whichever session runs next. Use `keep-working clean` if you want")
+            print("  to wipe state instead.")
+            return 0
+        print("No active keep-working sessions.", file=sys.stderr)
+        print("  If you want to preemptively write the stop-request flag anyway,", file=sys.stderr)
+        print("  use --force. Otherwise there's nothing to stop.", file=sys.stderr)
+        return 1
+    CLAUDE_DIR.mkdir(parents=True, exist_ok=True)
+    STOP_REQUEST_FILE.write_text("stop\n")
+    print(f"✓ Wrote {STOP_REQUEST_FILE}")
+    print(f"  {len(active)} active session(s) will deactivate on their next tool call.")
+    return 0
+
+
+def cmd_clean(args: argparse.Namespace) -> int:
+    removed = 0
+    for path, _ in _load_sessions():
+        try:
+            path.unlink()
+            removed += 1
+        except Exception:
+            pass
+    for f in (PENDING_FILE, STOP_REQUEST_FILE):
+        if f.exists():
+            try:
+                f.unlink()
+                removed += 1
+            except Exception:
+                pass
+    print(f"✓ Removed {removed} file(s).")
+    return 0
+
+
+def cmd_log(args: argparse.Namespace) -> int:
+    if not LOG_FILE.exists():
+        print("(no log)")
+        return 0
+    n = args.n
+    try:
+        lines = LOG_FILE.read_text(errors="replace").splitlines()
+    except Exception as e:
+        print(f"failed to read log: {e}", file=sys.stderr)
+        return 1
+    for line in lines[-n:]:
+        print(line)
+    return 0
+
+
+def cmd_version(args: argparse.Namespace) -> int:
+    print(f"keep-working {VERSION}")
+    return 0
+
+
+def cmd_extend(args: argparse.Namespace) -> int:
+    """Extend the deadline of active keep-working sessions."""
+    sessions = _load_sessions()
+    if not sessions:
+        print("No active sessions.", file=sys.stderr)
+        return 1
+    target = sessions
+    if args.session:
+        target = [(p, s) for p, s in sessions
+                  if args.session in s.get("session_id", p.stem)]
+        if not target:
+            print(f"No session matching {args.session!r}.", file=sys.stderr)
+            return 1
+    sec = int(args.minutes * 60)
+    for path, s in target:
+        now = time.time()
+        base = max(s.get("deadline_epoch", now), now)
+        s["deadline_epoch"] = base + sec
+        try:
+            path.write_text(json.dumps(s, indent=2))
+            sid = s.get("session_id", path.stem)[:12]
+            new_end = time.strftime("%H:%M", time.localtime(s["deadline_epoch"]))
+            sign = "+" if sec >= 0 else ""
+            print(f"✓ {sid}… {sign}{args.minutes:g} min → new deadline {new_end}")
+        except Exception as e:
+            print(f"✗ {path.name}: {e}", file=sys.stderr)
+            return 1
+    return 0
+
+
+def cmd_config(args: argparse.Namespace) -> int:
+    """Show current env var configuration."""
+    vars = [
+        ("KEEP_WORKING_NUDGE_CAP",       500,         "Max nudges per session"),
+        ("KEEP_WORKING_STAGNATION_CAP",  3,           "Release after N empty stops"),
+        ("KEEP_WORKING_LOG_MAX_BYTES",   1_000_000,   "Max log size before truncation"),
+        ("KEEP_WORKING_ORPHAN_TTL_SEC",  86_400,      "Orphan session-file TTL"),
+        ("KEEP_WORKING_PENDING_TTL_SEC", 600,         "Pending file TTL"),
+        ("KEEP_WORKING_SCAN_MAX_BYTES",  5_000_000,   "Max bytes to scan from transcript"),
+        ("CLAUDE_HOME",                  str(Path.home() / ".claude"), "Claude config dir"),
+    ]
+    print(f"{'VARIABLE':<32} {'VALUE':<20} DEFAULT  DESCRIPTION")
+    print("-" * 90)
+    for name, default, desc in vars:
+        actual = os.environ.get(name, "")
+        set_mark = " " if actual else "d"  # 'd' = default
+        value = actual if actual else str(default)
+        print(f"{name:<32} {value:<20} {set_mark}       {desc}")
+    print()
+    print("  d = using built-in default (env var not set)")
+    return 0
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """Sanity-check that the skill + hook + settings.json are correctly wired."""
+    ok = True
+    quiet = getattr(args, "quiet", False)
+    def emit(line: str) -> None:
+        if not quiet:
+            print(line)
+    def check(label, cond, hint=""):
+        nonlocal ok
+        if cond:
+            emit(f"  ✓ {label}")
+        else:
+            ok = False
+            emit(f"  ✗ {label}{' — ' + hint if hint else ''}")
+
+    emit(f"CLAUDE_DIR: {CLAUDE_DIR}")
+    emit(f"CLI version:  keep-working {VERSION}")
+    # Try to query the hook's own version
+    hook_probe = CLAUDE_DIR / "hooks" / "keep-working.py"
+    if hook_probe.exists():
+        try:
+            import subprocess as _sp
+            r = _sp.run(
+                ["python3", str(hook_probe), "--version"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if r.returncode == 0:
+                emit(f"Hook version: {r.stdout.strip()}")
+                if VERSION not in r.stdout:
+                    ok = False
+                    emit(f"  ✗ hook version mismatch — re-run install.sh")
+        except Exception:
+            pass
+    emit("")
+
+    # 1. Hook script exists + is executable
+    hook_path = CLAUDE_DIR / "hooks" / "keep-working.py"
+    check("hook script exists at ~/.claude/hooks/keep-working.py",
+          hook_path.exists(),
+          "run install.sh")
+    if hook_path.exists():
+        check("hook script is executable",
+              os.access(hook_path, os.X_OK),
+              f"chmod +x {hook_path}")
+
+    # 2. Skill dir
+    skill_dir = CLAUDE_DIR / "skills" / "keep-working"
+    check("skill dir exists at ~/.claude/skills/keep-working/",
+          skill_dir.exists(),
+          "run install.sh")
+    check("SKILL.md present",
+          (skill_dir / "SKILL.md").exists())
+
+    # 3. settings.json has both hooks
+    settings_path = CLAUDE_DIR / "settings.json"
+    if not settings_path.exists():
+        check("settings.json exists", False, f"create {settings_path}")
+        return 1 if not ok else 0
+    try:
+        settings = json.loads(settings_path.read_text())
+    except Exception as e:
+        check("settings.json parseable", False, f"JSON error: {e}")
+        return 1
+    check("settings.json parseable", True)
+    hooks = settings.get("hooks", {})
+    def has_hook(event, suffix):
+        for g in hooks.get(event, []):
+            for h in g.get("hooks", []):
+                cmd = h.get("command", "")
+                if "keep-working.py" in cmd and cmd.rstrip().endswith(suffix):
+                    return True
+        return False
+    check("PreToolUse bind hook registered",
+          has_hook("PreToolUse", "bind"),
+          "run install.sh")
+    check("Stop hook registered",
+          has_hook("Stop", "stop"),
+          "run install.sh")
+
+    # 4. Directories writable
+    check("sessions dir writable",
+          os.access(str(SESSIONS_DIR), os.W_OK) if SESSIONS_DIR.exists() else True,
+          "check permissions")
+
+    # 5. Try running the hook with a no-op payload
+    if hook_path.exists():
+        import subprocess
+        r = subprocess.run(
+            ["python3", str(hook_path), "stop"],
+            input='{"session_id":"doctor-probe","transcript_path":"/nonexistent"}',
+            capture_output=True, text=True, timeout=5,
+        )
+        check("hook runs without crashing", r.returncode in (0, 2))
+
+    # 6. Log file exists but isn't huge
+    if LOG_FILE.exists():
+        sz = LOG_FILE.stat().st_size
+        check(f"log file size sane ({sz} bytes, cap 1MB by default)",
+              sz < 10_000_000,
+              "consider `keep-working clean` or set KEEP_WORKING_LOG_MAX_BYTES")
+
+    # 7. python3 in PATH (since the hook command hardcodes python3)
+    import shutil as _sh
+    check("python3 on PATH (used by hook command in settings.json)",
+          _sh.which("python3") is not None,
+          "install python3 or edit settings.json to use another interpreter")
+
+    emit("")
+    if ok:
+        emit("✓ All checks passed. You are ready to use keep-working.")
+        return 0
+    else:
+        emit("✗ Some checks failed. Fix the items above and re-run `keep-working doctor`.")
+        return 1
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(prog="keep-working", description=__doc__)
+    sub = p.add_subparsers(dest="cmd")
+
+    stat_p = sub.add_parser("status", help="show active sessions in detail")
+    stat_p.add_argument("--json", action="store_true", help="machine-readable JSON output")
+    stat_p.set_defaults(func=cmd_status)
+    sub.add_parser("list", help="terse one-line-per-session listing").set_defaults(func=cmd_list)
+    stop_p = sub.add_parser("stop", help="request active sessions to stop")
+    stop_p.add_argument("--force", "-f", action="store_true", help="write stop-request even if no active sessions")
+    stop_p.set_defaults(func=cmd_stop)
+    sub.add_parser("clean", help="remove all keep-working state files").set_defaults(func=cmd_clean)
+    log_p = sub.add_parser("log", help="tail the keep-working log")
+    log_p.add_argument("-n", type=int, default=50, help="number of lines (default 50)")
+    log_p.set_defaults(func=cmd_log)
+    sub.add_parser("version").set_defaults(func=cmd_version)
+    doc_p = sub.add_parser("doctor", help="sanity-check the installation")
+    doc_p.add_argument("--quiet", "-q", action="store_true", help="suppress output, exit code only")
+    doc_p.set_defaults(func=cmd_doctor)
+    sub.add_parser("config", help="show env var configuration").set_defaults(func=cmd_config)
+    ext_p = sub.add_parser("extend", help="extend (or shorten with negative) a session's deadline")
+    ext_p.add_argument("minutes", type=float, help="minutes to add (negative to shorten)")
+    ext_p.add_argument("--session", "-s", default=None, help="substring match on session_id (default: all sessions)")
+    ext_p.set_defaults(func=cmd_extend)
+
+    args = p.parse_args()
+    if not args.cmd:
+        p.print_help()
+        return 0
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
