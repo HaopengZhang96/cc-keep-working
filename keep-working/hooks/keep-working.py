@@ -292,9 +292,28 @@ def cmd_bind(payload: dict) -> None:
         # 3. Claim pending file → bind to this session.
         if not PENDING_FILE.exists():
             return
+
+        # If this session already has a state file, check whether the
+        # pending file is NEWER. A newer pending means the user started a
+        # fresh keep-working request in the same session (e.g. after the
+        # previous one expired, stagnated, or Claude Code stopped due to
+        # context exhaustion). In that case, replace the old state.
         if sf.exists():
-            # Don't clobber existing state for this session.
-            return
+            try:
+                old_state = json.loads(sf.read_text())
+                old_bound = float(old_state.get("bound_at_epoch", 0) or 0)
+                pending_peek = json.loads(PENDING_FILE.read_text())
+                pending_created = float(pending_peek.get("created_at_epoch", 0) or 0)
+                if pending_created > old_bound:
+                    _safe_unlink(sf)
+                    _log(
+                        f"bind: replacing stale session for sid={sid[:8]} "
+                        f"(old bound={old_bound:.0f}, new pending={pending_created:.0f})"
+                    )
+                else:
+                    return  # pending is older than current state, ignore
+            except Exception:
+                return  # can't read either file, fail open
 
         # Atomic claim: rename the pending file to a unique staging name.
         # At most one process can succeed; the rest get FileNotFoundError.

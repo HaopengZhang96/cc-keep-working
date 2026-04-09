@@ -129,14 +129,28 @@ class TestBind(HookTestBase):
         self.run_hook("bind", {"session_id": "sid-Y"})
         self.assertFalse(self.pending.exists())
 
-    def test_existing_session_not_clobbered(self):
-        self.write_pending(task="new-task")
+    def test_existing_session_not_clobbered_by_older_pending(self):
+        """If state file's bound_at_epoch is MORE RECENT than pending's
+        created_at_epoch, the pending is ignored (not a new request)."""
+        # Write an "old" pending (created 10s ago)
+        self.pending.write_text(json.dumps({
+            "active": True,
+            "deadline_epoch": time.time() + 3600,
+            "task": "stale-pending",
+            "created_at_epoch": time.time() - 10,
+        }))
+        # Write a "newer" state file (bound just now)
         sf = self.session_file_for("sid-Z")
-        sf.write_text(json.dumps({"active": True, "task": "old-task", "session_id": "sid-Z"}))
+        sf.write_text(json.dumps({
+            "active": True,
+            "task": "current-task",
+            "session_id": "sid-Z",
+            "bound_at_epoch": time.time(),
+        }))
         self.run_hook("bind", {"session_id": "sid-Z"})
-        # pending stays untouched (wasn't claimed)
+        # pending stays untouched, state unchanged
         self.assertTrue(self.pending.exists())
-        self.assertEqual(json.loads(sf.read_text())["task"], "old-task")
+        self.assertEqual(json.loads(sf.read_text())["task"], "current-task")
 
     def test_orphan_sweep(self):
         old = self.sessions / "orphan_dead.json"
@@ -159,6 +173,46 @@ class TestBind(HookTestBase):
         self.run_hook("bind", {"session_id": "sid-S"})
         self.assertFalse(self.stop_request.exists())
         self.assertFalse(any(self.sessions.glob("sid-S*.json")))
+
+    def test_same_session_reclaim_newer_pending(self):
+        """If the user starts a NEW keep-working request in the SAME session
+        (e.g. after context exhaustion killed the previous run), the newer
+        pending should replace the old state file."""
+        # First keep-working session
+        self.write_pending(task="old task")
+        self.run_hook("bind", {"session_id": "sid-R"})
+        sf = next(self.sessions.glob("sid-R*.json"))
+        old_state = json.loads(sf.read_text())
+        self.assertEqual(old_state["task"], "old task")
+
+        # Simulate time passing, then user starts a new keep-working request
+        time.sleep(0.1)
+        self.write_pending(task="new task")
+        self.run_hook("bind", {"session_id": "sid-R"})
+        new_state = json.loads(sf.read_text())
+        self.assertEqual(new_state["task"], "new task")
+        self.assertFalse(self.pending.exists(), "pending should be consumed")
+
+    def test_same_session_older_pending_ignored(self):
+        """If the pending file is OLDER than the current state (race
+        condition or stale file), don't replace."""
+        # Write pending first
+        self.write_pending(task="stale pending")
+        time.sleep(0.1)
+        # Then bind — state file's bound_at_epoch > pending's created_at_epoch
+        self.run_hook("bind", {"session_id": "sid-O"})
+        sf = next(self.sessions.glob("sid-O*.json"))
+
+        # Write another pending that is OLDER (by faking created_at_epoch)
+        self.pending.write_text(json.dumps({
+            "active": True,
+            "deadline_epoch": time.time() + 3600,
+            "task": "older pending",
+            "created_at_epoch": time.time() - 9999,
+        }))
+        self.run_hook("bind", {"session_id": "sid-O"})
+        state = json.loads(sf.read_text())
+        self.assertEqual(state["task"], "stale pending")  # unchanged
 
     def test_insane_deadline_clamped(self):
         """A pending file with a 100-year deadline should be clamped to
