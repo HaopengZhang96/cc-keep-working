@@ -509,6 +509,170 @@ class TestTranscriptScan(HookTestBase):
         self.assertEqual(code, 2)  # still blocks — missing transcript just means ctx=0
 
 
+class TestAutoDetect(HookTestBase):
+    """Stop hook auto-detects keep-working trigger from transcript
+    when no state file exists (fallback activation)."""
+
+    def _write_transcript_with_user_msg(self, text: str) -> str:
+        tr = self.sandbox / f"transcript-{time.time_ns()}.jsonl"
+        with open(tr, "w") as f:
+            f.write(json.dumps({
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": text}],
+                }
+            }) + "\n")
+            # Add an assistant response with tool_use so it doesn't
+            # immediately stagnate.
+            f.write(json.dumps({
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "t1"}],
+                    "usage": {"input_tokens": 1000},
+                }
+            }) + "\n")
+        return str(tr)
+
+    def test_auto_detect_chinese_hours(self):
+        tr = self._write_transcript_with_user_msg("请持续工作 2 小时，优化代码")
+        code, err, _ = self.run_hook("stop", {
+            "session_id": "sid-auto-cn",
+            "transcript_path": tr,
+        })
+        self.assertEqual(code, 2)
+        self.assertIn("优化代码", err)
+        # State file should have been created
+        sf = self._session_filename("sid-auto-cn")
+        self.assertTrue(sf.exists())
+        state = json.loads(sf.read_text())
+        self.assertTrue(state.get("auto_detected"))
+        # Deadline should be ~2h from now
+        remaining = state["deadline_epoch"] - time.time()
+        self.assertGreater(remaining, 7000)
+        self.assertLess(remaining, 7300)
+
+    def test_auto_detect_english(self):
+        tr = self._write_transcript_with_user_msg(
+            "keep working for 30 min on the refactor"
+        )
+        code, err, _ = self.run_hook("stop", {
+            "session_id": "sid-auto-en",
+            "transcript_path": tr,
+        })
+        self.assertEqual(code, 2)
+        sf = self._session_filename("sid-auto-en")
+        state = json.loads(sf.read_text())
+        remaining = state["deadline_epoch"] - time.time()
+        self.assertGreater(remaining, 1700)  # ~30min
+        self.assertLess(remaining, 1900)
+
+    def test_auto_detect_chinese_minutes(self):
+        tr = self._write_transcript_with_user_msg("连续工作 90 分钟做测试")
+        code, _, _ = self.run_hook("stop", {
+            "session_id": "sid-auto-min",
+            "transcript_path": tr,
+        })
+        self.assertEqual(code, 2)
+        sf = self._session_filename("sid-auto-min")
+        state = json.loads(sf.read_text())
+        remaining = state["deadline_epoch"] - time.time()
+        self.assertGreater(remaining, 5300)  # ~90min
+        self.assertLess(remaining, 5500)
+
+    def test_no_auto_detect_without_trigger(self):
+        tr = self._write_transcript_with_user_msg("帮我优化一下代码")
+        code, _, _ = self.run_hook("stop", {
+            "session_id": "sid-no-trigger",
+            "transcript_path": tr,
+        })
+        self.assertEqual(code, 0)  # allowed to stop
+
+    def test_no_auto_detect_without_duration(self):
+        tr = self._write_transcript_with_user_msg("请持续工作，优化代码")
+        code, _, _ = self.run_hook("stop", {
+            "session_id": "sid-no-dur",
+            "transcript_path": tr,
+        })
+        self.assertEqual(code, 0)  # no duration → no auto-detect
+
+    def test_auto_detect_does_not_fire_if_state_exists(self):
+        """If state file already exists, auto-detect should NOT run."""
+        self.write_pending(task="existing")
+        self.run_hook("bind", {"session_id": "sid-existing"})
+        tr = self._write_transcript_with_user_msg("请持续工作 5 小时")
+        # Stop should use the existing state, not auto-detect
+        code, err, _ = self.run_hook("stop", {
+            "session_id": "sid-existing",
+            "transcript_path": tr,
+        })
+        self.assertEqual(code, 2)
+        sf = self._session_filename("sid-existing")
+        state = json.loads(sf.read_text())
+        self.assertEqual(state["task"], "existing")  # not overwritten
+
+    def _session_filename(self, sid):
+        return session_filename(sid, self.sessions)
+
+
+class TestCtxPressure(HookTestBase):
+    """Context pressure warning when ctx_tokens is high or flatlined."""
+
+    def test_ctx_pressure_warning_ratio(self):
+        self.write_pending(max_tokens=1_000_000, task="pressure test")
+        self.run_hook("bind", {"session_id": "sid-P"})
+        # Create transcript with high ctx_tokens (>75% of max)
+        tr = self.sandbox / "big-ctx.jsonl"
+        tr.write_text(json.dumps({
+            "message": {
+                "content": [{"type": "tool_use", "id": "t"}],
+                "usage": {"input_tokens": 800_000},
+            }
+        }) + "\n")
+        code, err, _ = self.run_hook("stop", {
+            "session_id": "sid-P",
+            "transcript_path": str(tr),
+        })
+        self.assertEqual(code, 2)
+        self.assertIn("/compact", err)
+
+    def test_ctx_flatline_warning(self):
+        self.write_pending(max_tokens=5_000_000, task="flatline test")
+        self.run_hook("bind", {"session_id": "sid-F"})
+        tr = self.sandbox / "flat.jsonl"
+        tr.write_text(json.dumps({
+            "message": {
+                "content": [{"type": "tool_use", "id": "t"}],
+                "usage": {"input_tokens": 500_000},
+            }
+        }) + "\n")
+        # 3 stops with same ctx → flatline detected on 3rd
+        self.run_hook("stop", {"session_id": "sid-F", "transcript_path": str(tr)})
+        self.run_hook("stop", {"session_id": "sid-F", "transcript_path": str(tr)})
+        code, err, _ = self.run_hook("stop", {
+            "session_id": "sid-F",
+            "transcript_path": str(tr),
+        })
+        self.assertEqual(code, 2)
+        self.assertIn("/compact", err)
+
+    def test_no_warning_when_ctx_low(self):
+        self.write_pending(max_tokens=5_000_000, task="low ctx")
+        self.run_hook("bind", {"session_id": "sid-L"})
+        tr = self.sandbox / "low.jsonl"
+        tr.write_text(json.dumps({
+            "message": {
+                "content": [{"type": "tool_use", "id": "t"}],
+                "usage": {"input_tokens": 100_000},
+            }
+        }) + "\n")
+        code, err, _ = self.run_hook("stop", {
+            "session_id": "sid-L",
+            "transcript_path": str(tr),
+        })
+        self.assertEqual(code, 2)
+        self.assertNotIn("/compact", err)
+
+
 class TestEnvVars(HookTestBase):
 
     def test_stagnation_cap_env_override(self):

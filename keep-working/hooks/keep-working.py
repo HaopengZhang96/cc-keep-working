@@ -419,6 +419,102 @@ def _build_reason(task: str, remaining_min: int, nudge: int, cap: int,
         )
 
 
+_KEEP_WORKING_RE = re.compile(
+    r"(?:请?持续工作|连续工作|不要停|不停地工作|一直做|keep\s*working|work\s*(?:continuously|nonstop)|don'?t\s*stop)"
+    r".*?"
+    r"(\d+(?:\.\d+)?)\s*"
+    r"(小时|h(?:ours?)?|分钟|min(?:utes?)?|m(?!\w))",
+    re.IGNORECASE | re.DOTALL,
+)
+
+# Approximate context-pressure threshold. If ctx_tokens exceeds this
+# fraction of max_tokens (or an absolute threshold), warn Claude to use
+# /compact or summarize intermediate results.
+CTX_PRESSURE_RATIO = 0.75
+CTX_PRESSURE_ABS = _env_int("KEEP_WORKING_CTX_WARN_TOKENS", 800_000)
+
+
+def _auto_detect_keep_working(transcript_path: str) -> dict | None:
+    """Scan the LAST portion of the transcript for a user message that
+    contains a keep-working trigger phrase with a duration. Returns a
+    state dict ready to be written, or None if not found.
+
+    This is the FALLBACK activation path: if Claude didn't invoke the
+    keep-working skill (didn't write a pending file), the Stop hook can
+    still activate by detecting the user's intent directly from the
+    transcript. This handles the case where the user says "请持续工作 2h"
+    mid-conversation and Claude just says "OK" without writing pending.
+    """
+    if not transcript_path or not os.path.exists(transcript_path):
+        return None
+    # Read only the last 500KB — the trigger phrase is in a recent message.
+    try:
+        size = os.path.getsize(transcript_path)
+        read_from = max(0, size - 500_000)
+        with open(transcript_path, "rb") as f:
+            if read_from > 0:
+                f.seek(read_from)
+                f.readline()  # drop partial line
+            content = f.read().decode("utf-8", errors="replace")
+    except Exception:
+        return None
+
+    # Look for user messages with role:"user" containing trigger phrases.
+    # Walk JSONL lines, find the LATEST matching user message.
+    best = None
+    for line in content.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        # Claude Code transcript JSONL has varied shapes. We look for
+        # {"role":"user", ...} or {"message":{"role":"user", "content":...}}
+        msg = obj
+        if "message" in obj and isinstance(obj["message"], dict):
+            msg = obj["message"]
+        if msg.get("role") != "user":
+            continue
+        # Extract text content
+        text_parts = []
+        content_field = msg.get("content", "")
+        if isinstance(content_field, str):
+            text_parts.append(content_field)
+        elif isinstance(content_field, list):
+            for part in content_field:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    text_parts.append(part.get("text", ""))
+                elif isinstance(part, str):
+                    text_parts.append(part)
+        full_text = " ".join(text_parts)
+        m = _KEEP_WORKING_RE.search(full_text)
+        if m:
+            num = float(m.group(1))
+            unit = m.group(2).lower()
+            if unit in ("小时", "h", "hour", "hours"):
+                hours = num
+            else:  # minutes
+                hours = num / 60
+            hours = min(hours, 24)
+            if hours > 0:
+                best = {
+                    "active": True,
+                    "deadline_epoch": time.time() + hours * 3600,
+                    "max_turns": 200,
+                    "max_tokens": 2_000_000,
+                    "nudge_count": 0,
+                    "empty_stops": 0,
+                    "last_transcript_size": 0,
+                    "task": full_text[:500],
+                    "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                    "created_at_epoch": time.time(),
+                    "auto_detected": True,
+                }
+    return best
+
+
 def cmd_stop(payload: dict) -> None:
     try:
         # Recursion guard.
@@ -429,8 +525,26 @@ def cmd_stop(payload: dict) -> None:
         if not sid:
             sys.exit(0)
         sf = _session_filename(sid)
+
+        # FALLBACK AUTO-DETECTION: if no state file exists for this session,
+        # scan the transcript for a keep-working trigger phrase. If found,
+        # create the state file on the fly and block the stop.
         if not sf.exists():
-            sys.exit(0)
+            transcript_path = payload.get("transcript_path", "")
+            auto = _auto_detect_keep_working(transcript_path)
+            if auto is None:
+                sys.exit(0)
+            # Auto-create the state file.
+            try:
+                SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                sys.exit(0)
+            auto["session_id"] = sid
+            auto["bound_at_epoch"] = time.time()
+            _write_state(sf, auto)
+            _log(f"stop: auto-detected keep-working for sid={sid[:8]} "
+                 f"task={auto['task'][:40]!r}")
+            # Fall through to the normal blocking logic below.
         try:
             state = json.loads(sf.read_text())
         except Exception:
@@ -500,19 +614,54 @@ def cmd_stop(payload: dict) -> None:
             )
             sys.exit(0)
 
+        # Context pressure detection (BEFORE state save so flat_count persists).
+        ctx_warning = ""
+        ctx_under_pressure = False
+        if max_tokens and ctx_tokens > max_tokens * CTX_PRESSURE_RATIO:
+            ctx_under_pressure = True
+        elif ctx_tokens > CTX_PRESSURE_ABS:
+            ctx_under_pressure = True
+        prev_ctx = int(state.get("last_ctx_tokens", 0) or 0)
+        ctx_flat_count = int(state.get("ctx_flat_count", 0) or 0)
+        if ctx_tokens > 0 and ctx_tokens == prev_ctx:
+            ctx_flat_count += 1
+        else:
+            ctx_flat_count = 0
+        if ctx_flat_count >= 2:
+            ctx_under_pressure = True
+
         # Persist counters.
         state["nudge_count"] = nudge_count
         state["last_transcript_size"] = curr_size
         state["last_ctx_tokens"] = ctx_tokens
         state["empty_stops"] = empty_stops
+        state["ctx_flat_count"] = ctx_flat_count
         state["last_stop_epoch"] = now
         _write_state(sf, state)
 
         remaining_min = max(0, int((deadline - now) // 60)) if deadline else -1
+
+        if ctx_under_pressure:
+            if _detect_chinese(task):
+                ctx_warning = (
+                    "\n\n⚠️ 上下文压力警告：ctx tokens 已经很高或已停止增长 "
+                    f"(ctx={ctx_tokens}, flat={ctx_flat_count} 轮)。"
+                    "请立即执行 /compact 压缩上下文，或在代码中写一份进度摘要"
+                    "然后继续。否则 Claude Code 可能因上下文耗尽而崩溃终止。"
+                )
+            else:
+                ctx_warning = (
+                    "\n\n⚠️ CONTEXT PRESSURE WARNING: ctx tokens are high or "
+                    f"have flatlined (ctx={ctx_tokens}, flat={ctx_flat_count} turns). "
+                    "Run /compact NOW to compress context, or write a progress "
+                    "summary to a file and continue. Otherwise Claude Code may "
+                    "crash from context exhaustion."
+                )
+
         reason = _build_reason(
             task, remaining_min, nudge_count, max_turns,
             ctx_tokens, max_tokens, empty_stops,
-        )
+        ) + ctx_warning
         _log(
             f"stop: blocked sid={sid[:8]} nudge={nudge_count} "
             f"empty={empty_stops} ctx={ctx_tokens}"
