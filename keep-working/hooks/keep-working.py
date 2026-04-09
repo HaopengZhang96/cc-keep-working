@@ -66,7 +66,7 @@ def _env_int(name: str, default: int) -> int:
 PENDING_TTL_SEC = _env_int("KEEP_WORKING_PENDING_TTL_SEC", 600)
 ORPHAN_TTL_SEC = _env_int("KEEP_WORKING_ORPHAN_TTL_SEC", 86_400)
 NUDGE_CAP_DEFAULT = min(_env_int("KEEP_WORKING_NUDGE_CAP", 500), 5_000)
-STAGNATION_CAP = max(1, _env_int("KEEP_WORKING_STAGNATION_CAP", 3))
+STAGNATION_CAP = max(1, _env_int("KEEP_WORKING_STAGNATION_CAP", 5))
 LOG_MAX_BYTES = max(10_000, _env_int("KEEP_WORKING_LOG_MAX_BYTES", 1_000_000))
 # Defense in depth: ignore deadlines farther than this in the future.
 # SKILL.md also clamps hours ≤ 24 on the Claude side, but a buggy / hand-
@@ -400,18 +400,22 @@ def _build_reason(task: str, remaining_min: int, nudge: int, cap: int,
             f"[keep-working] 不要停止。请继续执行：{task}\n"
             f"剩余：{rem}。Nudge {nudge}/{cap_str}。"
             f"上下文 tokens：{tok_str}。空停：{empty_stops}/{STAGNATION_CAP}。\n"
-            "如果当前子任务完成了，请立即挑选下一个对目标最有价值的子任务继续工作 — "
-            "不要只做总结。如果真的需要用户输入，不要问：挑最合理的默认值继续，"
-            "用户之后可以纠正。如果真的没事可做了，不要调用任何工具直接停止，"
-            f"停滞检测器会在连续 {STAGNATION_CAP} 次空停后释放你。"
+            "重要：你必须在下一轮回复中至少调用一个工具（Read/Edit/Bash/Grep/Write 等）。"
+            "纯文本回复不算工作，连续纯文本回复会触发停滞释放。\n"
+            "如果当前子任务完成了，请立即挑选下一个对目标最有价值的子任务继续工作。"
+            "如果真的需要用户输入，不要问：挑最合理的默认值继续，用户之后可以纠正。"
+            f"如果确实没有任何事可做了，连续 {STAGNATION_CAP} 次不调用工具即可自动释放。"
         )
     else:
         return (
             f"[keep-working] DO NOT STOP. Continue working on: {task}\n"
             f"Time remaining: {rem}. Nudge {nudge}/{cap_str}. "
             f"Context tokens: {tok_str}. Empty stops: {empty_stops}/{STAGNATION_CAP}.\n"
+            "IMPORTANT: You MUST make at least one tool call (Read/Edit/Bash/Grep/Write etc.) "
+            "in your next response. Pure-text responses count as empty and will trigger "
+            "stagnation release.\n"
             "If the current sub-task is finished, pick the NEXT most useful "
-            "sub-task toward the goal and keep working — do not just summarize. "
+            "sub-task toward the goal and keep working. "
             "If you genuinely need user input, do not ask: pick the most "
             "reasonable default and proceed. If there is truly nothing left "
             "to do, stop without making any tool calls and the stagnation "
@@ -553,6 +557,7 @@ def cmd_stop(payload: dict) -> None:
             sys.exit(0)
         if not state.get("active"):
             _safe_unlink(sf)
+            _log(f"stop: ALLOWED (inactive state) sid={sid[:8]}")
             sys.exit(0)
 
         now = time.time()

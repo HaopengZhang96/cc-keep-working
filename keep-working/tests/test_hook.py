@@ -358,31 +358,26 @@ class TestStop(HookTestBase):
             }) + "\n")
 
     def test_stagnation_detection_text_only_turns(self):
-        """3 consecutive assistant turns with NO tool_use → release."""
+        """5 consecutive assistant turns with NO tool_use → release (cap=5)."""
         self.write_pending()
         self.run_hook("bind", {"session_id": "sid-S"})
         tr = self.sandbox / "transcript.jsonl"
-        # Initial: one tool_use (normal work)
         self._append_tool_use(tr)
         codes = []
 
-        # Stop 1: delta has 1 tool_use → progress → empty_stops=0, block
+        # Stop 1: delta has tool_use → empty_stops=0, block
         c, _, _ = self.run_hook("stop", {"session_id": "sid-S", "transcript_path": str(tr)})
         codes.append(c)
-        # Append text-only turn (Claude "done" narration)
+        # Stops 2-5: text-only turns → empty_stops = 1,2,3,4, all block
+        for _ in range(4):
+            self._append_text(tr)
+            c, _, _ = self.run_hook("stop", {"session_id": "sid-S", "transcript_path": str(tr)})
+            codes.append(c)
+        # Stop 6: empty_stops=5 = STAGNATION_CAP → release
         self._append_text(tr)
-        # Stop 2: delta has 0 tool_use → empty_stops=1, block
         c, _, _ = self.run_hook("stop", {"session_id": "sid-S", "transcript_path": str(tr)})
         codes.append(c)
-        self._append_text(tr)
-        # Stop 3: empty_stops=2, block
-        c, _, _ = self.run_hook("stop", {"session_id": "sid-S", "transcript_path": str(tr)})
-        codes.append(c)
-        self._append_text(tr)
-        # Stop 4: empty_stops=3 = STAGNATION_CAP → release
-        c, _, _ = self.run_hook("stop", {"session_id": "sid-S", "transcript_path": str(tr)})
-        codes.append(c)
-        self.assertEqual(codes, [2, 2, 2, 0])
+        self.assertEqual(codes, [2, 2, 2, 2, 2, 0])
 
     def test_progress_resets_stagnation(self):
         self.write_pending()
