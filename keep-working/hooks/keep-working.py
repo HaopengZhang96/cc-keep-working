@@ -360,10 +360,41 @@ def cmd_bind(payload: dict) -> None:
         _write_state(sf, data)
         _safe_unlink(stage)
         _log(f"bind: claimed pending for sid={sid[:8]} task={(data.get('task') or '')[:40]!r}")
+
+        # Auto-start watchdog if not already running.
+        _ensure_watchdog()
     except Exception:
         _log(f"bind: unhandled error: {traceback.format_exc().splitlines()[-1]}")
     finally:
         sys.exit(0)
+
+
+def _ensure_watchdog() -> None:
+    """Start the watchdog daemon if it isn't already running."""
+    try:
+        watchdog_script = Path(__file__).resolve().parent / "watchdog.py"
+        if not watchdog_script.exists():
+            # Also check installed location
+            watchdog_script = CLAUDE_DIR / "hooks" / "watchdog.py"
+        if not watchdog_script.exists():
+            return
+        pid_file = SESSIONS_DIR / "watchdog.pid"
+        if pid_file.exists():
+            try:
+                pid = int(pid_file.read_text().strip())
+                os.kill(pid, 0)  # check alive
+                return  # already running
+            except (OSError, ValueError):
+                pass  # stale pid
+        import subprocess as _sp
+        _sp.Popen(
+            [sys.executable, str(watchdog_script), "start"],
+            stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+            start_new_session=True,
+        )
+        _log("bind: started watchdog")
+    except Exception:
+        pass  # non-critical
 
 
 # ---------- subcommand: stop ----------

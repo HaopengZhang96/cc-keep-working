@@ -251,6 +251,22 @@ def cmd_config(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_watchdog(args: argparse.Namespace) -> int:
+    """Proxy to watchdog.py."""
+    import subprocess as _sp
+    wd_cmd = getattr(args, "wd_cmd", None) or "status"
+    # Find watchdog.py next to the CLI or in hooks dir
+    cli_dir = Path(__file__).resolve().parent.parent
+    watchdog = cli_dir / "hooks" / "watchdog.py"
+    if not watchdog.exists():
+        watchdog = CLAUDE_DIR / "hooks" / "watchdog.py"
+    if not watchdog.exists():
+        print("watchdog.py not found. Run install.sh first.", file=sys.stderr)
+        return 1
+    r = _sp.run([sys.executable, str(watchdog), wd_cmd])
+    return r.returncode
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     """Sanity-check that the skill + hook + settings.json are correctly wired."""
     ok = True
@@ -383,6 +399,15 @@ def main() -> int:
     log_p.add_argument("-n", type=int, default=50, help="number of lines (default 50)")
     log_p.set_defaults(func=cmd_log)
     sub.add_parser("version").set_defaults(func=cmd_version)
+    # Watchdog subcommands
+    wd_p = sub.add_parser("watchdog", help="manage the heartbeat watchdog daemon")
+    wd_sub = wd_p.add_subparsers(dest="wd_cmd")
+    wd_sub.add_parser("start", help="start the watchdog daemon")
+    wd_sub.add_parser("stop", help="stop the watchdog daemon")
+    wd_sub.add_parser("status", help="check if watchdog is running")
+    wd_sub.add_parser("run", help="run watchdog in foreground (debug)")
+    wd_p.set_defaults(func=cmd_watchdog)
+
     doc_p = sub.add_parser("doctor", help="sanity-check the installation")
     doc_p.add_argument("--quiet", "-q", action="store_true", help="suppress output, exit code only")
     doc_p.set_defaults(func=cmd_doctor)

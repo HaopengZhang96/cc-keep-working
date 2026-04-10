@@ -40,9 +40,10 @@ cp "$SCRIPT_DIR/SKILL.md" "$SKILLS_DIR/SKILL.md"
 cp "$SCRIPT_DIR/hooks/keep-working.py" "$SKILLS_DIR/hooks/keep-working.py"
 [ -f "$SCRIPT_DIR/README.md" ] && cp "$SCRIPT_DIR/README.md" "$SKILLS_DIR/README.md"
 
-# 2. Copy hook script to active hooks dir
+# 2. Copy hook scripts to active hooks dir
 cp "$SCRIPT_DIR/hooks/keep-working.py" "$HOOKS_DIR/keep-working.py"
 chmod +x "$HOOKS_DIR/keep-working.py" || true
+[ -f "$SCRIPT_DIR/hooks/watchdog.py" ] && cp "$SCRIPT_DIR/hooks/watchdog.py" "$HOOKS_DIR/watchdog.py" && chmod +x "$HOOKS_DIR/watchdog.py" || true
 
 # 3. Copy CLI helper if present
 if [ -f "$SCRIPT_DIR/bin/keep-working" ]; then
