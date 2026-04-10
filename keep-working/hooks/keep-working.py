@@ -423,12 +423,27 @@ def _build_reason(task: str, remaining_min: int, nudge: int, cap: int,
         )
 
 
+# Auto-detect regex: must be an IMPERATIVE request, not a mention/complaint.
+# Requires the trigger phrase to appear near the START of the message (within
+# first 100 chars) to avoid matching mid-sentence references like
+# "早上有个5h的持续工作，没有继续" (complaint, not a request).
 _KEEP_WORKING_RE = re.compile(
-    r"(?:请?持续工作|连续工作|不要停|不停地工作|一直做|keep\s*working|work\s*(?:continuously|nonstop)|don'?t\s*stop)"
+    r"^.{0,60}"  # trigger must be near the start of the message
+    r"(?:请|帮我|please\s+)?"  # optional polite prefix
+    r"(?:持续工作|连续工作|不要停.*?(?:工作|做)|不停地工作|一直做"
+    r"|keep\s+working|work\s+(?:continuously|nonstop)|don'?t\s+stop)"
     r".*?"
     r"(\d+(?:\.\d+)?)\s*"
     r"(小时|h(?:ours?)?|分钟|min(?:utes?)?|m(?!\w))",
     re.IGNORECASE | re.DOTALL,
+)
+
+# Negative patterns: if any of these appear in the same message, the trigger
+# phrase is likely a reference/complaint, not a request. Skip auto-detect.
+_KEEP_WORKING_NEGATIVE_RE = re.compile(
+    r"(?:没有继续|停了|不工作|没生效|有问题|bug|不行|失败|failed|stopped|didn'?t work"
+    r"|not working|issue|problem)",
+    re.IGNORECASE,
 )
 
 # Approximate context-pressure threshold. If ctx_tokens exceeds this
@@ -493,6 +508,9 @@ def _auto_detect_keep_working(transcript_path: str) -> dict | None:
                 elif isinstance(part, str):
                     text_parts.append(part)
         full_text = " ".join(text_parts)
+        # Skip if the message contains negative/complaint language
+        if _KEEP_WORKING_NEGATIVE_RE.search(full_text):
+            continue
         m = _KEEP_WORKING_RE.search(full_text)
         if m:
             num = float(m.group(1))

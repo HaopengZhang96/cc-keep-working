@@ -590,6 +590,41 @@ class TestAutoDetect(HookTestBase):
         })
         self.assertEqual(code, 0)  # no duration → no auto-detect
 
+    def test_no_auto_detect_complaint(self):
+        """User is complaining about keep-working, not requesting it."""
+        complaints = [
+            "还是有问题，早上有个5h的持续工作，没有继续，20min就停了",
+            "持续工作 3 小时的功能有 bug，停了",
+            "keep working for 2 hours didn't work, it stopped after 10 min",
+            "the keep working 5h feature failed again",
+            "持续工作 2 小时没生效",
+            "连续工作 3h 不行，有问题",
+        ]
+        for i, text in enumerate(complaints):
+            tr = self._write_transcript_with_user_msg(text)
+            code, _, _ = self.run_hook("stop", {
+                "session_id": f"sid-complaint-{i}",
+                "transcript_path": tr,
+            })
+            self.assertEqual(code, 0, f"false positive on complaint: {text!r}")
+
+    def test_auto_detect_still_works_for_real_requests(self):
+        """Real requests must still trigger after the negative filter."""
+        requests = [
+            "请持续工作 3 小时，优化代码",
+            "持续工作 2h 做测试",
+            "连续工作 90 分钟做测试",
+            "keep working for 2 hours on the refactor",
+            "please keep working for 30 min",
+        ]
+        for i, text in enumerate(requests):
+            tr = self._write_transcript_with_user_msg(text)
+            code, _, _ = self.run_hook("stop", {
+                "session_id": f"sid-real-{i}",
+                "transcript_path": tr,
+            })
+            self.assertEqual(code, 2, f"missed real request: {text!r}")
+
     def test_auto_detect_does_not_fire_if_state_exists(self):
         """If state file already exists, auto-detect should NOT run."""
         self.write_pending(task="existing")
