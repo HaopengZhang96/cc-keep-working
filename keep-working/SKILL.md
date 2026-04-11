@@ -247,10 +247,35 @@ the session file's `deadline_epoch` — but the CLI is cleaner.
 A: Each has its own state file keyed by session_id hash; they don't
 interfere. `keep-working list` shows both.
 
+## Watchdog & Auto-Recovery
+
+The watchdog daemon monitors transcript file growth. If a session stalls
+(no transcript activity for `WATCHDOG_STALL_MIN` minutes, default 5), it:
+
+1. Sends a desktop notification (first detection)
+2. Waits one confirmation cycle to rule out transient delays
+3. Automatically resumes the session via `claude --resume <session-id>`
+4. Retries up to `WATCHDOG_RECOVER_MAX` times (default 3) with a
+   `WATCHDOG_RECOVER_COOLDOWN_MIN` minute cooldown (default 3)
+5. After max attempts: marks session unrecoverable, notifies user
+
+**Env vars:**
+- `WATCHDOG_AUTO_RECOVER=1` — enable/disable auto-recovery (default on)
+- `WATCHDOG_RECOVER_MAX=3` — max recovery attempts per stall episode
+- `WATCHDOG_RECOVER_COOLDOWN_MIN=3` — minutes between attempts
+
+**Manual recovery:**
+```bash
+keep-working recover                # auto-detect stalled sessions
+keep-working recover -s <sid>       # recover specific session
+keep-working watchdog recover <sid> # direct watchdog invocation
+```
+
 ## Caveats to mention if relevant
 
-- This skill only works while the Claude Code process is alive. Closing the
-  terminal kills the timer — there is no background daemon.
+- If the user deliberately closes the terminal, the watchdog will attempt
+  auto-recovery. Use `keep-working stop` before closing to prevent this,
+  or set `WATCHDOG_AUTO_RECOVER=0` to disable.
 - Token counts are approximate (max-per-message, not exact billing).
 - If installed via the plugin system, exit-code-2 Stop hooks may be silently
   ignored (Claude Code bug #10412). Always install via `~/.claude/hooks/`

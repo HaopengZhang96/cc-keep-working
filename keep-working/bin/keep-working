@@ -255,15 +255,56 @@ def cmd_watchdog(args: argparse.Namespace) -> int:
     """Proxy to watchdog.py."""
     import subprocess as _sp
     wd_cmd = getattr(args, "wd_cmd", None) or "status"
-    # Find watchdog.py next to the CLI or in hooks dir
+    watchdog = _find_watchdog()
+    if not watchdog:
+        return 1
+    cmd = [sys.executable, str(watchdog), wd_cmd]
+    # Pass session-id for recover subcommand
+    if wd_cmd == "recover" and getattr(args, "wd_session", None):
+        cmd.append(args.wd_session)
+    r = _sp.run(cmd)
+    return r.returncode
+
+
+def _find_watchdog() -> Path | None:
     cli_dir = Path(__file__).resolve().parent.parent
     watchdog = cli_dir / "hooks" / "watchdog.py"
     if not watchdog.exists():
         watchdog = CLAUDE_DIR / "hooks" / "watchdog.py"
     if not watchdog.exists():
         print("watchdog.py not found. Run install.sh first.", file=sys.stderr)
+        return None
+    return watchdog
+
+
+def cmd_recover(args: argparse.Namespace) -> int:
+    """Recover a stalled session via watchdog."""
+    import subprocess as _sp
+    watchdog = _find_watchdog()
+    if not watchdog:
         return 1
-    r = _sp.run([sys.executable, str(watchdog), wd_cmd])
+    session = getattr(args, "session", None) or ""
+    if not session:
+        # Find any stalled sessions automatically
+        sessions = _load_sessions()
+        stalled = []
+        for path, s in sessions:
+            if not s.get("active"):
+                continue
+            sid = s.get("session_id", "")
+            stall_marker = SESSIONS_DIR / f".stall-{sid[:16]}"
+            if stall_marker.exists():
+                stalled.append((path, s))
+        if not stalled:
+            print("No stalled sessions found. Use --session <id> to force.", file=sys.stderr)
+            return 1
+        for path, s in stalled:
+            sid = s.get("session_id", "")
+            task = (s.get("task", "") or "")[:50]
+            print(f"Recovering {sid[:12]}… ({task})")
+            _sp.run([sys.executable, str(watchdog), "recover", sid])
+        return 0
+    r = _sp.run([sys.executable, str(watchdog), "recover", session])
     return r.returncode
 
 
@@ -406,7 +447,13 @@ def main() -> int:
     wd_sub.add_parser("stop", help="stop the watchdog daemon")
     wd_sub.add_parser("status", help="check if watchdog is running")
     wd_sub.add_parser("run", help="run watchdog in foreground (debug)")
+    wd_rec = wd_sub.add_parser("recover", help="manually recover a stalled session")
+    wd_rec.add_argument("wd_session", nargs="?", help="session ID prefix")
     wd_p.set_defaults(func=cmd_watchdog)
+    # Shortcut: keep-working recover
+    rec_p = sub.add_parser("recover", help="recover stalled sessions (shortcut for watchdog recover)")
+    rec_p.add_argument("--session", "-s", default=None, help="session ID prefix (default: auto-detect stalled)")
+    rec_p.set_defaults(func=cmd_recover)
 
     doc_p = sub.add_parser("doctor", help="sanity-check the installation")
     doc_p.add_argument("--quiet", "-q", action="store_true", help="suppress output, exit code only")

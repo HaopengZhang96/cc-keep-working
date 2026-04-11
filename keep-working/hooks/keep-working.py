@@ -472,8 +472,9 @@ _KEEP_WORKING_RE = re.compile(
 # Negative patterns: if any of these appear in the same message, the trigger
 # phrase is likely a reference/complaint, not a request. Skip auto-detect.
 _KEEP_WORKING_NEGATIVE_RE = re.compile(
-    r"(?:没有继续|停了|不工作|没生效|有问题|bug|不行|失败|failed|stopped|didn'?t work"
-    r"|not working|issue|problem)",
+    r"(?:没有继续|没持续|没成功|停了|不工作|没生效|有问题|bug|不行|失败"
+    r"|没.*?成功|昨[晚天]|上次|之前"
+    r"|failed|stopped|didn'?t work|not working|issue|problem|last\s+(?:night|time))",
     re.IGNORECASE,
 )
 
