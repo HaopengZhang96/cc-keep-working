@@ -35,7 +35,7 @@ single short sentence what duration they want — unless they also say
 | `duration` | yes | — | 24 hours | Accept hours OR minutes. Convert minutes → hours / 60. |
 | `task` | yes | — | — | What to work on. If absent and user is in autonomous mode, infer from prior conversation. |
 | `max_turns` | no | 200 | 1000 | Hook also defends with `KEEP_WORKING_NUDGE_CAP` env var. |
-| `max_tokens` | no | 2,000,000 | 20,000,000 | Approximate context-tokens cap (max single message, not sum). |
+| `max_tokens` | no | 800,000 | 5,000,000 | Approximate context-tokens cap. Claude Code slows dramatically past 400k, near-stalls at 600k, so 800k default is realistic. Hook warns at 400k, urges /compact at 600k. |
 
 Refuse silently-and-cap if user asks for >24h, >1000 turns, or >20M tokens —
 clamp to the ceiling and tell them in one line.
@@ -111,6 +111,39 @@ will trigger bind. Then drive the task to completion.
 - Periodically (every 15-30 minutes of work) write a brief progress note to
   the user as a regular text response. This is the only place they can see
   what you're doing.
+
+### Context management — critical for long sessions
+
+Claude Code's context window is the #1 reason long keep-working sessions
+die. Empirical behavior:
+
+- **< 400k tokens**: fast, healthy
+- **400k–600k**: responses slow noticeably, occasional timeouts
+- **600k+**: near-stall; each turn takes 5-15 min, then often hangs
+
+The hook monitors context and injects warnings when you cross these
+thresholds. When you see `🚨 CRITICAL CONTEXT PRESSURE` or the ctx value
+climbs past 400k, YOU MUST:
+
+1. **Persist progress to a file FIRST.** Write `PROGRESS.md` (or a
+   task-specific name) in the project root containing:
+   - The overall task and sub-tasks
+   - What's been completed (with file paths / commit hashes)
+   - What's still to do (ordered)
+   - Any key decisions / assumptions made
+   - Any blockers encountered
+   This is your recovery point — if context gets compacted or the
+   session resumes later, the next Claude reads this file and knows
+   where to pick up.
+
+2. **Then run `/compact`** to compress conversation history. This is a
+   Claude Code slash command; invoke it like any other user input.
+   Compaction preserves enough context for you to continue but cuts
+   token count by 70-90%.
+
+Do these BEFORE ctx hits 600k. Waiting until the warning turns critical
+often means you can't even finish writing PROGRESS.md because each turn
+takes 10 minutes.
 
 ## How to stop early
 

@@ -478,11 +478,12 @@ _KEEP_WORKING_NEGATIVE_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Approximate context-pressure threshold. If ctx_tokens exceeds this
-# fraction of max_tokens (or an absolute threshold), warn Claude to use
-# /compact or summarize intermediate results.
-CTX_PRESSURE_RATIO = 0.75
-CTX_PRESSURE_ABS = _env_int("KEEP_WORKING_CTX_WARN_TOKENS", 800_000)
+# Context-pressure thresholds. Claude models have 200k native context; with
+# extended window the effective ceiling varies, but empirically Claude Code
+# starts struggling (slow responses, stalls) once ctx > 400k. By 600-700k it's
+# effectively stuck. Warn aggressively.
+CTX_PRESSURE_WARN_TOKENS = _env_int("KEEP_WORKING_CTX_WARN_TOKENS", 400_000)
+CTX_PRESSURE_CRITICAL_TOKENS = _env_int("KEEP_WORKING_CTX_CRITICAL_TOKENS", 600_000)
 
 
 def _auto_detect_keep_working(transcript_path: str) -> dict | None:
@@ -557,7 +558,7 @@ def _auto_detect_keep_working(transcript_path: str) -> dict | None:
                     "active": True,
                     "deadline_epoch": time.time() + hours * 3600,
                     "max_turns": 200,
-                    "max_tokens": 2_000_000,
+                    "max_tokens": 800_000,
                     "nudge_count": 0,
                     "empty_stops": 0,
                     "last_transcript_size": 0,
@@ -670,20 +671,23 @@ def cmd_stop(payload: dict) -> None:
             sys.exit(0)
 
         # Context pressure detection (BEFORE state save so flat_count persists).
+        # Three tiers:
+        #   warn      (>400k OR 2+ flat) — suggest progress-to-file + /compact
+        #   critical  (>600k)            — strongly urge /compact, context near ceiling
+        #   flatline  (ctx unchanged 2+) — context likely AT ceiling, urgent
         ctx_warning = ""
-        ctx_under_pressure = False
-        if max_tokens and ctx_tokens > max_tokens * CTX_PRESSURE_RATIO:
-            ctx_under_pressure = True
-        elif ctx_tokens > CTX_PRESSURE_ABS:
-            ctx_under_pressure = True
+        ctx_level = None  # None | "warn" | "critical"
         prev_ctx = int(state.get("last_ctx_tokens", 0) or 0)
         ctx_flat_count = int(state.get("ctx_flat_count", 0) or 0)
         if ctx_tokens > 0 and ctx_tokens == prev_ctx:
             ctx_flat_count += 1
         else:
             ctx_flat_count = 0
-        if ctx_flat_count >= 2:
-            ctx_under_pressure = True
+
+        if ctx_tokens >= CTX_PRESSURE_CRITICAL_TOKENS or ctx_flat_count >= 2:
+            ctx_level = "critical"
+        elif ctx_tokens >= CTX_PRESSURE_WARN_TOKENS:
+            ctx_level = "warn"
 
         # Persist counters.
         state["nudge_count"] = nudge_count
@@ -696,22 +700,37 @@ def cmd_stop(payload: dict) -> None:
 
         remaining_min = max(0, int((deadline - now) // 60)) if deadline else -1
 
-        if ctx_under_pressure:
-            if _detect_chinese(task):
-                ctx_warning = (
-                    "\n\n⚠️ 上下文压力警告：ctx tokens 已经很高或已停止增长 "
-                    f"(ctx={ctx_tokens}, flat={ctx_flat_count} 轮)。"
-                    "请立即执行 /compact 压缩上下文，或在代码中写一份进度摘要"
-                    "然后继续。否则 Claude Code 可能因上下文耗尽而崩溃终止。"
-                )
-            else:
-                ctx_warning = (
-                    "\n\n⚠️ CONTEXT PRESSURE WARNING: ctx tokens are high or "
-                    f"have flatlined (ctx={ctx_tokens}, flat={ctx_flat_count} turns). "
-                    "Run /compact NOW to compress context, or write a progress "
-                    "summary to a file and continue. Otherwise Claude Code may "
-                    "crash from context exhaustion."
-                )
+        if ctx_level:
+            is_zh = _detect_chinese(task)
+            ctx_k = ctx_tokens // 1000
+            if ctx_level == "critical":
+                if is_zh:
+                    ctx_warning = (
+                        f"\n\n🚨 上下文严重压力 (ctx={ctx_k}k, flat={ctx_flat_count} 轮)："
+                        "Claude Code 在 400k+ 上下文时响应急剧变慢，600k+ 几乎停滞。"
+                        "下一步必须：(1) 立即把当前进度写入文件（如 /tmp/progress.md 或项目内 PROGRESS.md），"
+                        "(2) 然后立即运行 /compact 命令压缩对话历史（以必要信息保留：当前任务、已完成步骤、待办步骤、关键文件路径）。"
+                        "不这么做，会话会在几轮内完全卡死。"
+                    )
+                else:
+                    ctx_warning = (
+                        f"\n\n🚨 CRITICAL CONTEXT PRESSURE (ctx={ctx_k}k, flat={ctx_flat_count}): "
+                        "Claude Code responses slow dramatically past 400k context, stall near 600k. "
+                        "NEXT: (1) Write current progress to a file (e.g. PROGRESS.md), "
+                        "(2) Run /compact to compress conversation history. "
+                        "Without this, the session will fully stall within a few turns."
+                    )
+            else:  # warn
+                if is_zh:
+                    ctx_warning = (
+                        f"\n\n⚠️ 上下文压力渐显 (ctx={ctx_k}k)：建议把关键进度落盘到文件，"
+                        "达到 600k 前考虑运行 /compact。"
+                    )
+                else:
+                    ctx_warning = (
+                        f"\n\n⚠️ Context pressure building (ctx={ctx_k}k): "
+                        "persist progress to files; consider /compact before hitting 600k."
+                    )
 
         reason = _build_reason(
             task, remaining_min, nudge_count, max_turns,

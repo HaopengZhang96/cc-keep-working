@@ -43,8 +43,18 @@ PID_FILE = SESSIONS_DIR / "watchdog.pid"
 LOG_FILE = SESSIONS_DIR / "log.txt"
 
 INTERVAL = int(os.environ.get("WATCHDOG_INTERVAL_SEC", "") or 60)
-STALL_MIN = int(os.environ.get("WATCHDOG_STALL_MIN", "") or 5)
-AUTO_RECOVER = os.environ.get("WATCHDOG_AUTO_RECOVER", "1") not in ("0", "false", "no")
+# Raised from 5 to 10 min — long tool calls (big Grep, slow Bash, heavy Read)
+# can legitimately take 5-8 min without the transcript advancing, especially
+# at high context. 5 min was producing >70% false-positive stall events.
+STALL_MIN = int(os.environ.get("WATCHDOG_STALL_MIN", "") or 10)
+# Default OFF. In practice `claude --resume <sid> -p "..."` spawns a
+# non-interactive subprocess that does NOT unstick a hung interactive
+# session — the original process still owns the session file, and the
+# new process either exits immediately or writes to a different session.
+# Empirically, 39 recovery attempts across multiple stalled sessions never
+# revived the transcript. We keep the code paths but default OFF so we
+# don't spawn zombie claude processes.
+AUTO_RECOVER = os.environ.get("WATCHDOG_AUTO_RECOVER", "0") not in ("0", "false", "no")
 RECOVER_MAX = int(os.environ.get("WATCHDOG_RECOVER_MAX", "") or 3)
 RECOVER_COOLDOWN_MIN = int(os.environ.get("WATCHDOG_RECOVER_COOLDOWN_MIN", "") or 3)
 
@@ -69,6 +79,29 @@ def _notify(title: str, body: str) -> None:
     except Exception:
         # Fallback: terminal bell
         sys.stderr.write(f"\a[watchdog] {title}: {body}\n")
+
+
+def _any_claude_process_alive() -> bool:
+    """Check whether ANY `claude` CLI process is currently running.
+
+    This is a best-effort liveness signal. If the transcript is idle but
+    a claude process is still alive, the session is likely doing a long
+    tool call (not a true stall). If NO claude processes exist, Claude
+    Code crashed / was closed / API hung — worth notifying.
+
+    We can't scope this to a specific session_id because pgrep doesn't
+    show the session argument. False negatives (claude running in another
+    unrelated window) just mean we skip one stall notification — OK.
+    """
+    try:
+        r = subprocess.run(
+            ["pgrep", "-x", "claude"],
+            capture_output=True, text=True, timeout=3,
+        )
+        return r.returncode == 0 and bool(r.stdout.strip())
+    except Exception:
+        # pgrep unavailable — fall back to "assume alive" to avoid false positives
+        return True
 
 
 def _find_transcript(session_id: str) -> str | None:
@@ -213,19 +246,27 @@ def _check_once() -> None:
         stall_data = _read_stall_marker(sid)
 
         if age_min > STALL_MIN:
+            # Check if any claude process is still alive. If yes, this is
+            # most likely a legitimate long tool call (big search, slow bash),
+            # not a real stall. Skip notification.
+            claude_alive = _any_claude_process_alive()
+
             if stall_data is None:
                 # --- First detection: notify + write marker, wait for confirmation ---
+                if claude_alive:
+                    _log(f"STALL suppressed sid={sid[:8]} age={int(age_min)}min — claude process still alive (likely long tool call)")
+                    continue
                 task = (s.get("task", "") or "")[:60]
                 remaining = max(0, int((deadline - now) / 60)) if deadline else -1
                 rem_str = f"{remaining}min left" if remaining >= 0 else "no deadline"
                 body = (
-                    f"Session {sid[:8]} stalled — no activity for {int(age_min)} min. "
-                    f"Task: {task}... ({rem_str})"
+                    f"Session {sid[:8]} stalled — no activity for {int(age_min)} min, "
+                    f"no claude process running. Task: {task}... ({rem_str})"
                 )
                 if AUTO_RECOVER:
                     body += " Auto-recovery in ~1 cycle."
                 _notify("keep-working: session stalled!", body)
-                _log(f"STALL detected sid={sid[:8]} age={int(age_min)}min transcript={transcript}")
+                _log(f"STALL detected sid={sid[:8]} age={int(age_min)}min (no claude proc) transcript={transcript}")
                 _write_stall_marker(sid, {
                     "detected_at": now,
                     "recovery_attempts": 0,
