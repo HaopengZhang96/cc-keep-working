@@ -193,6 +193,101 @@ def cmd_log(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_resume(args: argparse.Namespace) -> int:
+    """Resume a keep-working session by exec'ing `claude --resume <sid>`.
+
+    If the session's state file is still active (deadline not passed), the
+    existing Stop hook will continue to block early stops with the original
+    task. The user just needs to kick it off with a prompt (either typed
+    interactively or passed via -m).
+    """
+    import shutil as _sh
+    if not _sh.which("claude"):
+        print("error: `claude` CLI not found on PATH.", file=sys.stderr)
+        return 1
+
+    sessions = _load_sessions()
+    # Prefer active sessions with deadline in the future, ordered by most-recent bind.
+    now = time.time()
+    candidates = [
+        (p, s) for p, s in sessions
+        if s.get("active")
+    ]
+    # Sort by bound_at_epoch descending (most recent first).
+    candidates.sort(key=lambda ps: ps[1].get("bound_at_epoch", 0), reverse=True)
+
+    if args.session:
+        candidates = [
+            (p, s) for p, s in candidates
+            if args.session in s.get("session_id", p.stem)
+        ]
+        if not candidates:
+            print(f"No active session matching {args.session!r}.", file=sys.stderr)
+            return 1
+
+    if not candidates:
+        print("No active keep-working sessions to resume.", file=sys.stderr)
+        print("  (Check `keep-working list` — expired sessions are cleaned by the hook.)",
+              file=sys.stderr)
+        return 1
+
+    # Pick: explicit -s prefix took effect above. Otherwise if multiple,
+    # prompt unless --latest was passed.
+    if len(candidates) == 1 or args.latest:
+        path, s = candidates[0]
+    else:
+        print("Multiple active keep-working sessions:")
+        for i, (path, s) in enumerate(candidates, 1):
+            sid = s.get("session_id", path.stem)[:12]
+            rem = _fmt_remaining(s.get("deadline_epoch", 0))
+            task = (s.get("task", "") or "")[:60]
+            print(f"  [{i}] {sid}…  {rem:>8}  {task}")
+        print()
+        try:
+            choice = input(f"Pick [1-{len(candidates)}] (q=quit, l=latest): ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 1
+        if choice in ("q", "quit"):
+            return 1
+        if choice in ("l", "latest", ""):
+            path, s = candidates[0]
+        else:
+            try:
+                idx = int(choice) - 1
+                if 0 <= idx < len(candidates):
+                    path, s = candidates[idx]
+                else:
+                    print("Out of range.", file=sys.stderr)
+                    return 1
+            except ValueError:
+                print("Invalid input.", file=sys.stderr)
+                return 1
+
+    sid = s.get("session_id", "")
+    task = s.get("task", "") or ""
+    rem = _fmt_remaining(s.get("deadline_epoch", 0))
+
+    print(f"→ Resuming {sid[:12]}…  ({rem} remaining)")
+    print(f"  Task: {task[:100]}")
+    if args.message:
+        print(f"  Kick-off message: {args.message!r}")
+    print()
+
+    # Build command. Positional arg after --resume is the initial message.
+    cmd = ["claude", "--resume", sid]
+    if args.message:
+        cmd.append(args.message)
+
+    # Hand off the terminal via execvp. Our process becomes the Claude Code
+    # session — user interacts directly. Stop hook is still in settings.json
+    # so it will continue to block early stops against this session's
+    # state file.
+    os.execvp(cmd[0], cmd)
+    # Unreachable
+    return 0
+
+
 def cmd_version(args: argparse.Namespace) -> int:
     print(f"keep-working {VERSION}")
     return 0
@@ -440,6 +535,23 @@ def main() -> int:
     log_p.add_argument("-n", type=int, default=50, help="number of lines (default 50)")
     log_p.set_defaults(func=cmd_log)
     sub.add_parser("version").set_defaults(func=cmd_version)
+    res_p = sub.add_parser(
+        "resume",
+        help="exec `claude --resume <sid>` for an active keep-working session",
+    )
+    res_p.add_argument(
+        "-s", "--session", default=None,
+        help="substring match on session_id (default: pick interactively if >1)",
+    )
+    res_p.add_argument(
+        "-l", "--latest", action="store_true",
+        help="skip the picker and resume the most recently bound session",
+    )
+    res_p.add_argument(
+        "-m", "--message", default=None,
+        help="initial prompt to send on resume (e.g. '继续完成剩余 TODO')",
+    )
+    res_p.set_defaults(func=cmd_resume)
     # Watchdog subcommands
     wd_p = sub.add_parser("watchdog", help="manage the heartbeat watchdog daemon")
     wd_sub = wd_p.add_subparsers(dest="wd_cmd")

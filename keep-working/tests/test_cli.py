@@ -285,6 +285,46 @@ class TestLog(CLITestBase):
         self.assertNotIn("line 50", r.stdout)
 
 
+class TestResume(CLITestBase):
+
+    def test_resume_no_sessions(self):
+        r = self.run_cli("resume")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("No active", r.stderr + r.stdout)
+
+    def test_resume_no_match(self):
+        self.make_session("abc123", task="some task")
+        r = self.run_cli("resume", "-s", "nomatch")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("No active session matching", r.stderr + r.stdout)
+
+    def test_resume_help_works(self):
+        # We can't exec `claude` in tests, but --help shouldn't try to.
+        r = self.run_cli("resume", "--help")
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("--session", r.stdout)
+        self.assertIn("--latest", r.stdout)
+        self.assertIn("--message", r.stdout)
+
+    def test_resume_single_session_missing_claude(self):
+        """If only one active session but `claude` CLI is missing, fail
+        clearly instead of exec'ing garbage."""
+        self.make_session("only-one", task="the task")
+        # Keep python3 discoverable but scrub anything that might be `claude`.
+        # Point PATH at a temp empty dir alongside the system python paths.
+        import shutil as _sh
+        python_dir = str(Path(_sh.which("python3")).parent) if _sh.which("python3") else "/usr/bin"
+        empty_dir = self.sandbox / "empty_bin"
+        empty_dir.mkdir()
+        self.env["PATH"] = f"{python_dir}:{empty_dir}"
+        # Confirm `claude` is now hidden
+        if _sh.which("claude", path=self.env["PATH"]):
+            self.skipTest("Could not scrub claude from test PATH")
+        r = self.run_cli("resume")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("not found", r.stderr + r.stdout)
+
+
 class TestDoctor(CLITestBase):
 
     def test_doctor_fresh_sandbox_fails_gracefully(self):
