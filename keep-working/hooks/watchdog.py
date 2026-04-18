@@ -57,6 +57,14 @@ STALL_MIN = int(os.environ.get("WATCHDOG_STALL_MIN", "") or 10)
 AUTO_RECOVER = os.environ.get("WATCHDOG_AUTO_RECOVER", "0") not in ("0", "false", "no")
 RECOVER_MAX = int(os.environ.get("WATCHDOG_RECOVER_MAX", "") or 3)
 RECOVER_COOLDOWN_MIN = int(os.environ.get("WATCHDOG_RECOVER_COOLDOWN_MIN", "") or 3)
+# Max minutes we'll suppress a stall notification on the "claude process
+# alive" heuristic. Past this, even with a live process, transcript idleness
+# means something is stuck (API hang, network issue, model hung) and the
+# user needs to know. Empirically, Claude Code has been observed idle for
+# 69+ min with the process alive but no transcript activity.
+STALL_SUPPRESS_MAX_MIN = int(os.environ.get("WATCHDOG_STALL_SUPPRESS_MAX_MIN", "") or 20)
+# Don't log "STALL suppressed" on every check cycle — every 5 min is plenty.
+STALL_SUPPRESS_LOG_EVERY_MIN = 5
 
 
 def _log(msg: str) -> None:
@@ -219,6 +227,13 @@ def _recover_session(sid: str, state: dict, stall_data: dict) -> bool:
         return False
 
 
+# Per-session state used only within the running daemon (not persisted).
+# Tracks the last "age bucket" (units of STALL_SUPPRESS_LOG_EVERY_MIN
+# minutes) we logged for a suppressed stall, so we log at most once per
+# bucket — avoids 70 log lines / hour during long tool calls.
+_bucket_tracker: dict[str, int] = {}
+
+
 def _check_once() -> None:
     """One watchdog check cycle."""
     sessions = _load_active_sessions()
@@ -246,33 +261,50 @@ def _check_once() -> None:
         stall_data = _read_stall_marker(sid)
 
         if age_min > STALL_MIN:
-            # Check if any claude process is still alive. If yes, this is
-            # most likely a legitimate long tool call (big search, slow bash),
-            # not a real stall. Skip notification.
             claude_alive = _any_claude_process_alive()
 
             if stall_data is None:
-                # --- First detection: notify + write marker, wait for confirmation ---
-                if claude_alive:
-                    _log(f"STALL suppressed sid={sid[:8]} age={int(age_min)}min — claude process still alive (likely long tool call)")
+                # --- First detection ---
+                # Suppress the alert only for SHORT idleness (< STALL_SUPPRESS_MAX_MIN)
+                # when claude is alive. Long idleness is never a legitimate tool call.
+                if claude_alive and age_min < STALL_SUPPRESS_MAX_MIN:
+                    # Log at most every STALL_SUPPRESS_LOG_EVERY_MIN minutes.
+                    minute_bucket = int(age_min) // STALL_SUPPRESS_LOG_EVERY_MIN
+                    last_bucket = _bucket_tracker.get(sid, -1)
+                    if minute_bucket != last_bucket:
+                        _log(f"STALL suppressed sid={sid[:8]} age={int(age_min)}min — claude process alive (short stall, probably long tool call)")
+                        _bucket_tracker[sid] = minute_bucket
                     continue
+
                 task = (s.get("task", "") or "")[:60]
                 remaining = max(0, int((deadline - now) / 60)) if deadline else -1
                 rem_str = f"{remaining}min left" if remaining >= 0 else "no deadline"
-                body = (
-                    f"Session {sid[:8]} stalled — no activity for {int(age_min)} min, "
-                    f"no claude process running. Task: {task}... ({rem_str})"
-                )
+                if claude_alive:
+                    title = "keep-working: session possibly hanging"
+                    body = (
+                        f"Session {sid[:8]} — transcript idle for {int(age_min)} min "
+                        f"but claude process still alive (likely API hang or network issue). "
+                        f"Task: {task}... ({rem_str}). Consider Ctrl+C and re-resume."
+                    )
+                    detect_reason = f"long-hang (claude alive, idle {int(age_min)}min > suppress-max {STALL_SUPPRESS_MAX_MIN}min)"
+                else:
+                    title = "keep-working: session stalled!"
+                    body = (
+                        f"Session {sid[:8]} stalled — no activity for {int(age_min)} min, "
+                        f"no claude process running. Task: {task}... ({rem_str})"
+                    )
+                    detect_reason = "no claude process"
                 if AUTO_RECOVER:
                     body += " Auto-recovery in ~1 cycle."
-                _notify("keep-working: session stalled!", body)
-                _log(f"STALL detected sid={sid[:8]} age={int(age_min)}min (no claude proc) transcript={transcript}")
+                _notify(title, body)
+                _log(f"STALL detected sid={sid[:8]} age={int(age_min)}min ({detect_reason}) transcript={transcript}")
                 _write_stall_marker(sid, {
                     "detected_at": now,
                     "recovery_attempts": 0,
                     "last_recovery_at": None,
                     "unrecoverable": False,
                     "recovered_pids": [],
+                    "claude_alive_on_detect": claude_alive,
                 })
             elif not AUTO_RECOVER:
                 # Auto-recovery disabled — notification only (already sent)
@@ -299,7 +331,10 @@ def _check_once() -> None:
                     _recover_session(sid, s, stall_data)
                     _write_stall_marker(sid, stall_data)
         else:
-            # Session is alive — clear stall marker if it existed
+            # Session is alive — clear stall marker if it existed, and
+            # reset the per-session log bucket so a future suppression
+            # starts fresh.
+            _bucket_tracker.pop(sid, None)
             if stall_data is not None:
                 attempts = stall_data.get("recovery_attempts", 0)
                 if attempts > 0:
