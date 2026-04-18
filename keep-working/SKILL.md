@@ -166,12 +166,60 @@ This avoids the need for Claude to know its own `session_id`.
 
 ## Reporting completion
 
-When the deadline is reached and the hook releases the stop, before
-actually stopping write a brief summary to the user:
+When the hook releases you (deadline reached, caps hit, or stagnation),
+OR when the user explicitly says "stop keep working", you MUST output a
+final report before the turn ends. The user can't tell that you actually
+worked N hours unless you prove it with timing data.
 
-- What you accomplished
-- Anything left over / blocked
-- Wall-clock time you ran (in the user's timezone — Beijing time if Chinese)
+**Required format** (keep structure, translate to user's language):
+
+```
+✅ 持续工作结束 / keep-working session complete
+
+  开始 / Started   : 2026-04-14 06:42:10 (北京时间)
+  结束 / Ended     : 2026-04-14 11:15:47 (北京时间)
+  运行时长 / Elapsed: 4h 33m
+  Nudge 次数       : 18
+  最终上下文 tokens : 487k
+  释放原因         : deadline / turn-cap / stagnation / user-stop
+
+📋 完成的工作:
+  - <具体完成项 1，含文件路径>
+  - <具体完成项 2>
+  - ...
+
+⏳ 未完成 / 待续:
+  - <未完成项 1>（原因：context 压力 / 超出范围 / 阻塞等）
+  - ...
+
+💡 建议:
+  - <给用户的下一步建议>
+```
+
+Where to get the numbers:
+
+- **开始时间**: comes from `started_at` in the state file, and is also
+  embedded in every continuation message the hook injects (line
+  "Started at HH:MM, running XhYYm" / "开始于 HH:MM，已运行 XhYYm"). Read
+  the most recent continuation message to get it. Alternatively, the
+  `~/.claude/keep-working/<sid_hash>.json` state file (while it still
+  exists) has `started_at` as ISO string + `bound_at_epoch` epoch.
+- **结束时间**: wall-clock time NOW. Run `date` or use Python.
+- **运行时长**: end - start. The continuation messages include this
+  live; the last one you saw is the most recent estimate.
+- **Nudge 次数**: the last continuation message shows `Nudge N/cap`.
+- **最终上下文 tokens**: the last continuation message shows `ctx=Nk`.
+- **释放原因**: if this is a natural stop (no hook injection this turn)
+  and you were in keep-working mode, the most likely cause is: deadline
+  reached (time remaining was near 0 in the last nudge), stagnation
+  (after 5 text-only turns), or user typed "stop keep working".
+
+Use Beijing time (UTC+8) if the user's task description is in Chinese.
+Otherwise local time is fine.
+
+If you can't find the state file (already cleaned by hook on release),
+use the timing info from the LAST continuation message you received —
+that's always correct.
 
 ## Installation (run once per machine)
 

@@ -421,26 +421,75 @@ def _detect_chinese(s: str) -> bool:
     return any("\u4e00" <= ch <= "\u9fff" for ch in s or "")
 
 
+def _fmt_local_time(epoch: float) -> str:
+    """Format epoch as local HH:MM (e.g. '14:23')."""
+    try:
+        return time.strftime("%H:%M", time.localtime(epoch))
+    except Exception:
+        return "?"
+
+
+def _fmt_elapsed(started_epoch: float, now: float) -> str:
+    """Format duration as '2h34m'."""
+    try:
+        sec = max(0, int(now - started_epoch))
+        h, rem = divmod(sec, 3600)
+        m = rem // 60
+        if h:
+            return f"{h}h{m:02d}m"
+        return f"{m}m"
+    except Exception:
+        return "?"
+
+
 def _build_reason(task: str, remaining_min: int, nudge: int, cap: int,
-                  ctx_tokens: int, max_tokens: int, empty_stops: int) -> str:
+                  ctx_tokens: int, max_tokens: int, empty_stops: int,
+                  started_epoch: float = 0, now: float = 0) -> str:
     rem = f"~{remaining_min} min" if remaining_min >= 0 else "no deadline"
     cap_str = f"{cap}" if cap else "∞"
     tok_str = f"{ctx_tokens}/{max_tokens}" if max_tokens else f"{ctx_tokens}"
+    now = now or time.time()
+
+    # Timing line — embedded every nudge so Claude always knows duration.
+    start_str = _fmt_local_time(started_epoch) if started_epoch else "?"
+    elapsed_str = _fmt_elapsed(started_epoch, now) if started_epoch else "?"
+    wrap_up = (remaining_min >= 0 and remaining_min <= 5)  # deadline approaching
+
     if _detect_chinese(task):
+        timing = f"开始于 {start_str}，已运行 {elapsed_str}。"
+        wrap_up_line = ""
+        if wrap_up:
+            wrap_up_line = (
+                "\n⏰ 即将到时间：这是收尾阶段。请在接下来的回复中："
+                "(1) 把最关键的未完成项落盘到文件（PROGRESS.md 或项目内对应文件）; "
+                "(2) 做一轮简要的最终检查; "
+                "(3) 准备最终报告——结束时你必须输出：开始时间、结束时间、实际运行时长、完成的主要工作清单、未完成项。"
+            )
         return (
             f"[keep-working] 不要停止。请继续执行：{task}\n"
-            f"剩余：{rem}。Nudge {nudge}/{cap_str}。"
+            f"{timing} 剩余：{rem}。Nudge {nudge}/{cap_str}。"
             f"上下文 tokens：{tok_str}。空停：{empty_stops}/{STAGNATION_CAP}。\n"
             "重要：你必须在下一轮回复中至少调用一个工具（Read/Edit/Bash/Grep/Write 等）。"
             "纯文本回复不算工作，连续纯文本回复会触发停滞释放。\n"
             "如果当前子任务完成了，请立即挑选下一个对目标最有价值的子任务继续工作。"
             "如果真的需要用户输入，不要问：挑最合理的默认值继续，用户之后可以纠正。"
             f"如果确实没有任何事可做了，连续 {STAGNATION_CAP} 次不调用工具即可自动释放。"
+            + wrap_up_line
         )
     else:
+        timing = f"Started at {start_str}, running {elapsed_str}."
+        wrap_up_line = ""
+        if wrap_up:
+            wrap_up_line = (
+                "\n⏰ Deadline approaching: this is the wrap-up phase. In your next turns: "
+                "(1) persist key unfinished items to files (PROGRESS.md or equivalent); "
+                "(2) do a brief final sanity check; "
+                "(3) prepare the final report — at session end you MUST output: "
+                "start time, end time, actual elapsed duration, summary of completed work, list of unfinished items."
+            )
         return (
             f"[keep-working] DO NOT STOP. Continue working on: {task}\n"
-            f"Time remaining: {rem}. Nudge {nudge}/{cap_str}. "
+            f"{timing} Time remaining: {rem}. Nudge {nudge}/{cap_str}. "
             f"Context tokens: {tok_str}. Empty stops: {empty_stops}/{STAGNATION_CAP}.\n"
             "IMPORTANT: You MUST make at least one tool call (Read/Edit/Bash/Grep/Write etc.) "
             "in your next response. Pure-text responses count as empty and will trigger "
@@ -451,6 +500,7 @@ def _build_reason(task: str, remaining_min: int, nudge: int, cap: int,
             "reasonable default and proceed. If there is truly nothing left "
             "to do, stop without making any tool calls and the stagnation "
             f"detector will release you after {STAGNATION_CAP} empty stops."
+            + wrap_up_line
         )
 
 
@@ -732,9 +782,11 @@ def cmd_stop(payload: dict) -> None:
                         "persist progress to files; consider /compact before hitting 600k."
                     )
 
+        started_epoch = float(state.get("bound_at_epoch", 0) or state.get("created_at_epoch", 0) or 0)
         reason = _build_reason(
             task, remaining_min, nudge_count, max_turns,
             ctx_tokens, max_tokens, empty_stops,
+            started_epoch=started_epoch, now=now,
         ) + ctx_warning
         _log(
             f"stop: blocked sid={sid[:8]} nudge={nudge_count} "
