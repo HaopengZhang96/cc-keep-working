@@ -140,6 +140,37 @@ def _any_claude_process_alive() -> bool:
         return True
 
 
+def _extract_cwd_from_transcript(transcript_path: str) -> str | None:
+    """Claude Code's `--resume` is scoped to the project (cwd). To auto-
+    recover from a different working directory we must cd there first.
+
+    The project dir ~/.claude/projects/<encoded-cwd>/ encodes cwd by
+    replacing both `/` and `_` with `-`, which is ambiguous and can't
+    be reversed. Instead we grep the transcript JSONL for the first
+    `"cwd":"..."` value, which Claude Code writes explicitly.
+
+    Returns the cwd string or None if we can't find one.
+    """
+    if not transcript_path or not os.path.exists(transcript_path):
+        return None
+    try:
+        # The cwd usually appears in the first few KB.
+        with open(transcript_path, "rb") as f:
+            chunk = f.read(50_000)
+        text = chunk.decode("utf-8", errors="replace")
+        import re as _re
+        m = _re.search(r'"cwd"\s*:\s*"([^"]+)"', text)
+        if m:
+            cwd = m.group(1)
+            # Unescape common JSON escapes
+            cwd = cwd.replace("\\/", "/").replace("\\\\", "\\")
+            if os.path.isdir(cwd):
+                return cwd
+    except Exception:
+        pass
+    return None
+
+
 def _find_transcript(session_id: str) -> str | None:
     """Find the transcript JSONL for a session by looking through
     Claude Code project directories."""
@@ -232,6 +263,11 @@ def _recover_session(sid: str, state: dict, stall_data: dict) -> bool:
     because print-mode is one-shot; we need an interactive session so
     the keep-working Stop hook loop can resume.
 
+    Critical: `claude --resume` is scoped to the current project (cwd).
+    We must cd to the session's original cwd first, else `--resume` fails
+    with "No conversation found with session ID". The cwd is extracted
+    from the transcript JSONL.
+
     Returns True if recovery was triggered. Requires macOS (Terminal.app +
     osascript). On other platforms, logs and skips.
     """
@@ -251,14 +287,29 @@ def _recover_session(sid: str, state: dict, stall_data: dict) -> bool:
             _notify("keep-working: recovery failed", "claude CLI not found in PATH")
             return False
 
+        # Find the cwd so --resume can locate the conversation.
+        transcript = _find_transcript(sid)
+        cwd = _extract_cwd_from_transcript(transcript) if transcript else None
+        if not cwd:
+            _log(f"RECOVER FAILED sid={sid[:8]} — could not find cwd from transcript")
+            _notify(
+                "keep-working: recovery failed",
+                f"Session {sid[:8]} — couldn't determine project directory. `claude --resume` needs the right cwd.",
+            )
+            return False
+
         task = (state.get("task", "") or "")[:40]
         initial = os.environ.get("WATCHDOG_RECOVER_PROMPT") or "继续按原计划工作"
 
-        # Build the interactive shell command to run in the new Terminal tab.
-        # We source the user's shell profile so `claude` is on PATH.
-        shell_cmd = f'claude --resume {sid} "{_shell_quote_applescript(initial)}"'
+        # cd to the project dir, then run claude --resume interactively.
+        # Single-quote the cwd to survive spaces; AppleScript escape the
+        # whole command for embedding in `do script "..."`.
+        cwd_quoted = "'" + cwd.replace("'", "'\\''") + "'"
+        shell_cmd = (
+            f"cd {cwd_quoted} && "
+            f'claude --resume {sid} "{_shell_quote_applescript(initial)}"'
+        )
 
-        # AppleScript: open Terminal, run the command in a new window.
         applescript = (
             'tell application "Terminal"\n'
             '  activate\n'
@@ -292,10 +343,10 @@ def _recover_session(sid: str, state: dict, stall_data: dict) -> bool:
         stall_data.setdefault("recovered_pids", []).append(proc.pid)
 
         attempt = stall_data["recovery_attempts"]
-        _log(f"RECOVER attempt {attempt}/{RECOVER_MAX} sid={sid[:8]} — opened new Terminal window; task={task}")
+        _log(f"RECOVER attempt {attempt}/{RECOVER_MAX} sid={sid[:8]} cwd={cwd} task={task}")
         _notify(
             "keep-working: auto-recovering",
-            f"Session {sid[:8]} — opened new Terminal with `claude --resume` (attempt {attempt}/{RECOVER_MAX})",
+            f"Session {sid[:8]} — opened Terminal in {os.path.basename(cwd)} (attempt {attempt}/{RECOVER_MAX})",
         )
         return True
 
