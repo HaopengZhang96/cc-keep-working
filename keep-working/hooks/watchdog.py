@@ -89,18 +89,50 @@ def _notify(title: str, body: str) -> None:
         sys.stderr.write(f"\a[watchdog] {title}: {body}\n")
 
 
-def _any_claude_process_alive() -> bool:
-    """Check whether ANY `claude` CLI process is currently running.
+def _session_process_alive(session_id: str) -> bool | None:
+    """Check whether THIS session's claude process is running.
 
-    This is a best-effort liveness signal. If the transcript is idle but
-    a claude process is still alive, the session is likely doing a long
-    tool call (not a true stall). If NO claude processes exist, Claude
-    Code crashed / was closed / API hung — worth notifying.
+    Returns True if we found a `claude` process whose command line
+    contains `--resume <session_id>` or `<session_id>` as an argument.
+    Returns False if we could enumerate processes and found no match.
+    Returns None if we couldn't enumerate (pgrep/ps unavailable).
 
-    We can't scope this to a specific session_id because pgrep doesn't
-    show the session argument. False negatives (claude running in another
-    unrelated window) just mean we skip one stall notification — OK.
+    Previously we checked "any claude process alive" which caused false
+    negatives when the user had multiple Claude Code windows open: a
+    dead session's stall would be suppressed because a DIFFERENT live
+    session's process existed.
     """
+    if not session_id:
+        return None
+    try:
+        # `ps -Ao args=` gives each process's full command line. We look for
+        # lines that (a) reference the Claude Code binary AND (b) contain
+        # this session_id. This avoids shells/editors whose args happen to
+        # contain both "claude" and the sid.
+        # Use bytes mode to tolerate non-UTF-8 in other processes' args.
+        r = subprocess.run(
+            ["ps", "-Ao", "args="],
+            capture_output=True, timeout=5,
+        )
+        if r.returncode != 0:
+            return None
+        stdout = r.stdout.decode("utf-8", errors="replace")
+        # Signatures that reliably identify the Claude Code CLI binary.
+        # Strict enough to exclude random processes that mention the sid.
+        claude_markers = ("claude-code/", "/claude.app/Contents/MacOS/claude")
+        for line in stdout.splitlines():
+            if session_id not in line:
+                continue
+            if any(m in line for m in claude_markers):
+                return True
+        return False
+    except Exception:
+        return None
+
+
+def _any_claude_process_alive() -> bool:
+    """Legacy fallback: whether ANY claude process is running. Kept for
+    callers that don't have a session_id available."""
     try:
         r = subprocess.run(
             ["pgrep", "-x", "claude"],
@@ -108,7 +140,6 @@ def _any_claude_process_alive() -> bool:
         )
         return r.returncode == 0 and bool(r.stdout.strip())
     except Exception:
-        # pgrep unavailable — fall back to "assume alive" to avoid false positives
         return True
 
 
@@ -261,7 +292,12 @@ def _check_once() -> None:
         stall_data = _read_stall_marker(sid)
 
         if age_min > STALL_MIN:
-            claude_alive = _any_claude_process_alive()
+            # Prefer per-session check; fall back to any-claude when unknown.
+            sess_alive = _session_process_alive(sid)
+            if sess_alive is None:
+                claude_alive = _any_claude_process_alive()
+            else:
+                claude_alive = sess_alive
 
             if stall_data is None:
                 # --- First detection ---
