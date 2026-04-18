@@ -47,16 +47,13 @@ INTERVAL = int(os.environ.get("WATCHDOG_INTERVAL_SEC", "") or 60)
 # can legitimately take 5-8 min without the transcript advancing, especially
 # at high context. 5 min was producing >70% false-positive stall events.
 STALL_MIN = int(os.environ.get("WATCHDOG_STALL_MIN", "") or 10)
-# Default OFF. In practice `claude --resume <sid> -p "..."` spawns a
-# non-interactive subprocess that does NOT unstick a hung interactive
-# session — the original process still owns the session file, and the
-# new process either exits immediately or writes to a different session.
-# Empirically, 39 recovery attempts across multiple stalled sessions never
-# revived the transcript. We keep the code paths but default OFF so we
-# don't spawn zombie claude processes.
-AUTO_RECOVER = os.environ.get("WATCHDOG_AUTO_RECOVER", "0") not in ("0", "false", "no")
+# Default ON. Recovery now opens a NEW Terminal.app window running an
+# INTERACTIVE `claude --resume <sid> "继续"` (see _recover_session). The
+# new window loads settings.json hooks so the keep-working loop resumes
+# naturally. The old `-p`/non-interactive approach (removed) didn't work.
+AUTO_RECOVER = os.environ.get("WATCHDOG_AUTO_RECOVER", "1") not in ("0", "false", "no")
 RECOVER_MAX = int(os.environ.get("WATCHDOG_RECOVER_MAX", "") or 3)
-RECOVER_COOLDOWN_MIN = int(os.environ.get("WATCHDOG_RECOVER_COOLDOWN_MIN", "") or 3)
+RECOVER_COOLDOWN_MIN = int(os.environ.get("WATCHDOG_RECOVER_COOLDOWN_MIN", "") or 5)
 # Max minutes we'll suppress a stall notification on the "claude process
 # alive" heuristic. Past this, even with a live process, transcript idleness
 # means something is stuck (API hang, network issue, model hung) and the
@@ -223,36 +220,85 @@ def _clear_stall_marker(sid: str) -> None:
 
 # --- Auto-recovery ---
 
+def _shell_quote_applescript(s: str) -> str:
+    """Quote for embedding inside an AppleScript `do script` string literal."""
+    # AppleScript string literals use double quotes; backslash + quote escape.
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+
 def _recover_session(sid: str, state: dict, stall_data: dict) -> bool:
-    """Attempt to resume a stalled session via `claude --resume`.
-    Returns True if the process was spawned."""
+    """Open a NEW macOS Terminal window running `claude --resume <sid>`
+    with an initial "继续工作" prompt. The old `-p` approach didn't work
+    because print-mode is one-shot; we need an interactive session so
+    the keep-working Stop hook loop can resume.
+
+    Returns True if recovery was triggered. Requires macOS (Terminal.app +
+    osascript). On other platforms, logs and skips.
+    """
     try:
-        cmd = ["claude", "--resume", sid, "-p", "继续工作"]
+        # Detect macOS — osascript + Terminal.app is macOS-only.
+        if sys.platform != "darwin":
+            _log(f"RECOVER SKIPPED sid={sid[:8]} — auto-recovery currently macOS-only")
+            _notify(
+                "keep-working: auto-recover skipped",
+                f"Session {sid[:8]} stalled, platform={sys.platform} not supported for auto-recovery. Use `keep-working resume`.",
+            )
+            return False
+
+        import shutil as _sh
+        if not _sh.which("claude"):
+            _log(f"RECOVER FAILED sid={sid[:8]} — 'claude' not found in PATH")
+            _notify("keep-working: recovery failed", "claude CLI not found in PATH")
+            return False
+
+        task = (state.get("task", "") or "")[:40]
+        initial = os.environ.get("WATCHDOG_RECOVER_PROMPT") or "继续按原计划工作"
+
+        # Build the interactive shell command to run in the new Terminal tab.
+        # We source the user's shell profile so `claude` is on PATH.
+        shell_cmd = f'claude --resume {sid} "{_shell_quote_applescript(initial)}"'
+
+        # AppleScript: open Terminal, run the command in a new window.
+        applescript = (
+            'tell application "Terminal"\n'
+            '  activate\n'
+            f'  do script "{_shell_quote_applescript(shell_cmd)}"\n'
+            'end tell'
+        )
+
         proc = subprocess.Popen(
-            cmd,
+            ["osascript", "-e", applescript],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             start_new_session=True,
         )
+        # Give osascript a moment to dispatch (don't wait forever).
+        try:
+            _, stderr_bytes = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            _log(f"RECOVER TIMEOUT sid={sid[:8]} — osascript hung")
+            return False
+
+        if proc.returncode != 0:
+            err = stderr_bytes.decode("utf-8", errors="replace").strip()[:200]
+            _log(f"RECOVER FAILED sid={sid[:8]} — osascript rc={proc.returncode} err={err!r}")
+            _notify("keep-working: recovery failed", f"osascript error: {err[:100]}")
+            return False
+
         stall_data["recovery_attempts"] = stall_data.get("recovery_attempts", 0) + 1
         stall_data["last_recovery_at"] = time.time()
-        pids = stall_data.get("recovered_pids", [])
-        pids.append(proc.pid)
-        stall_data["recovered_pids"] = pids
+        stall_data.setdefault("recovered_pids", []).append(proc.pid)
 
         attempt = stall_data["recovery_attempts"]
-        task = (state.get("task", "") or "")[:40]
-        _log(f"RECOVER attempt {attempt}/{RECOVER_MAX} sid={sid[:8]} pid={proc.pid} task={task}")
+        _log(f"RECOVER attempt {attempt}/{RECOVER_MAX} sid={sid[:8]} — opened new Terminal window; task={task}")
         _notify(
             "keep-working: auto-recovering",
-            f"Session {sid[:8]} — attempt {attempt}/{RECOVER_MAX}",
+            f"Session {sid[:8]} — opened new Terminal with `claude --resume` (attempt {attempt}/{RECOVER_MAX})",
         )
         return True
-    except FileNotFoundError:
-        _log(f"RECOVER FAILED sid={sid[:8]} — 'claude' not found in PATH")
-        _notify("keep-working: recovery failed", "claude CLI not found in PATH")
-        return False
+
     except Exception as e:
         _log(f"RECOVER FAILED sid={sid[:8]} — {e}")
         return False
